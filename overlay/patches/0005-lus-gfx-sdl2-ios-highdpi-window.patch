@@ -1,0 +1,15 @@
+Add SDL_WINDOW_ALLOW_HIGHDPI to the iOS window flags (reference 0002,
+rebased into this fork's own __IOS__ branch) so SDL sets the CAMetalLayer
+contentsScale/drawableSize to native device pixels (1x blurry otherwise).
+
+--- a/libultraship/src/graphic/Fast3D/backends/gfx_sdl2.cpp
++++ b/libultraship/src/graphic/Fast3D/backends/gfx_sdl2.cpp
+@@ -357,7 +357,7 @@
+     int len = sprintf(title, "%s (%s)", gameName, gfxApiName);
+ 
+ #ifdef __IOS__
+-    Uint32 flags = SDL_WINDOW_BORDERLESS | SDL_WINDOW_SHOWN;
++    Uint32 flags = SDL_WINDOW_BORDERLESS | SDL_WINDOW_SHOWN | SDL_WINDOW_ALLOW_HIGHDPI;
+ #else
+     Uint32 flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
+ #endif

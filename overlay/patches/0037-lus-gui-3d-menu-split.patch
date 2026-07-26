@@ -1,0 +1,138 @@
+Generate 0037-lus-gui-3d-menu-split.patch.
+
+The 3D stereo path (0034) renders both eyes offscreen and NEVER runs the
+normal gui StartDraw/EndDraw (that path acquires the hidden window's
+drawable and draws the 2D game viewport). So on the panel the LUS menu and
+the perf HUD are invisible. Split the frame:
+
+  * Soh3DBuildMenuFrame() — run the ImGui frame WITHOUT the backend
+    NewFrame (the 0034 loop primed ImGui_ImplMetal against an eye
+    framebuffer) and WITHOUT the Main-Deck dockspace / DrawGame (that
+    hosts the game image and its window size drives CalculateGameViewport
+    = the top-left crop trap the Ship of Harkinian port hit). Draw the modern menu
+    (GetMenu, the PortMenu) + menubar directly, transparent, plus the
+    perf HUD into the foreground draw list (rides in the draw data, so it
+    reaches both eyes).
+  * Soh3DGetDrawData() — hand the built ImDrawData to the 0034 loop, which
+    renders it into BOTH eye framebuffers (flat on the panel).
+  * Soh3DFinishMenuFrame() — EndFrame + CheckSaveCvars once per host frame.
+
+Starship divergence vs the SpaghettiKart 0043 template: SpaghettiKart's
+live menu is SpaghettiGui::DrawMenu (a Gui subclass override) and the
+split calls DrawMenu() wholesale. Starship's menu is the modern PortMenu
+registered via Gui::SetMenu and drawn by GetMenu()->Draw(); there is no
+game Gui subclass. So this build method draws GetMenu()/GetMenuBar()
+DIRECTLY and never touches the Main-Deck dockspace — the "Main Game"
+re-dock self-heal SpaghettiKart needed is unnecessary here (3D never docks
+Main Game). The menu lays out against WorkSize, which imgui derives from
+io.DisplaySize; we override that to a 1920x1080 logical canvas (the parked
+window is only 480x320 = an 8x-too-large menu on the panel). The render
+step's FramebufferScale recompute (0034) maps it onto the eye texture.
+
+Depends on the 0034 shell externs + Soh3DImGuiPrime/Render and the shell's
+SohIos_PerfHud3DText (SohVision3D.m). __IOS__-guarded: the macOS build
+compiles this overlaid vendor but never references these (its caller in
+Fast3dWindow is __IOS__-guarded too).
+
+
+--- a/libultraship/src/window/gui/Gui.h
++++ b/libultraship/src/window/gui/Gui.h
+@@ -100,6 +100,12 @@
+     void SetMenu(std::shared_ptr<GuiWindow> menu);
+     std::shared_ptr<GuiWindow> GetMenu();
+     bool GetMenuOrMenubarVisible();
++    // SOH_IOS (overlay 0037): stereo 3D menu frame — build once (no backend
++    // NewFrame: the 0034 loop primed ImGui_ImplMetal with an eye
++    // framebuffer), render the draw data per eye, then finish.
++    void Soh3DBuildMenuFrame();
++    void* Soh3DGetDrawData();
++    void Soh3DFinishMenuFrame();
+     bool IsMouseOverAnyGuiItem();
+     bool IsMouseOverActivePopup();
+ 
+--- a/libultraship/src/window/gui/Gui.cpp
++++ b/libultraship/src/window/gui/Gui.cpp
+@@ -584,7 +584,83 @@
+     }
+ 
+     ImGui::End();
++}
++
++#ifdef __IOS__
++// SOH_IOS (overlay 0037): the 2D perf HUD is a UIKit label on the parked
++// window — invisible on the panel. The shell composes the same text here
++// and the 3D frame draws it into the eye images. Returns -1 when the HUD
++// is off, else the thermal state for color.
++extern "C" int SohIos_PerfHud3DText(char* buf, int cap);
++
++// SOH_IOS (overlay 0037): see Gui.h. No backend NewFrame (the 0034 loop
++// primed ImGui_ImplMetal against an eye framebuffer), no Main-Deck
++// dockspace / DrawGame — the menu composites over the rendered eyes.
++void Gui::Soh3DBuildMenuFrame() {
++    HandleMouseCapture();
++    ImGuiWMNewFrame();
++    // The SDL backend just set DisplaySize from the PARKED 480x320 card —
++    // menu layout against that renders ~8x too large on the panel. Lay out
++    // against a 2D-window-like logical canvas (the menu sizes off WorkSize,
++    // which imgui derives from DisplaySize); the render step's
++    // FramebufferScale recompute maps it onto the eye texture.
++    ImGui::GetIO().DisplaySize = ImVec2(1920.0f, 1080.0f);
++    ImGui::NewFrame();
++    // Device round 2: the fully-transparent 3D menu was unreadable and its
++    // backing did not fill the panel. When the menu is OPEN, dim the WHOLE
++    // panel behind it — the background draw list sits behind every ImGui
++    // window but IN FRONT of the rendered game in the eye texture — so the
++    // menu reads clearly and the dim fills the screen. Menu CLOSED: no dim,
++    // only the HUD below, game shows undimmed during play. NEVER open the
++    // Main-Deck dockspace here (it docks "Main Game" and its size drives
++    // CalculateGameViewport = top-left crop back in 2D).
++    bool sohMenuVis = GetMenuOrMenubarVisible();
++    if (sohMenuVis) {
++        ImGui::GetBackgroundDrawList()->AddRectFilled(
++            ImVec2(0.0f, 0.0f), ImGui::GetIO().DisplaySize, IM_COL32(0, 0, 0, 208));
++    }
++    if (GetMenuBar()) {
++        GetMenuBar()->Update();
++        GetMenuBar()->Draw();
++    }
++    if (GetMenu()) {
++        GetMenu()->Update();
++        GetMenu()->Draw();
++    }
++    // Notification overlay (toasts) — its own full-viewport window.
++    GetGameOverlay()->Draw();
++    // Perf HUD in 3D: same text as the 2D label, top-right, every frame the
++    // HUD CVar is on (independent of menu visibility). Foreground draw list
++    // is part of the draw data, so it reaches both eyes.
++    {
++        char sohHudBuf[64];
++        int sohHudTh = SohIos_PerfHud3DText(sohHudBuf, (int)sizeof(sohHudBuf));
++        if (sohHudTh >= 0 && sohHudBuf[0] != 0) {
++            ImDrawList* sohFg = ImGui::GetForegroundDrawList();
++            ImFont* sohFont = ImGui::GetFont();
++            const float sohHudSize = 30.0f;
++            ImVec2 sohTs = sohFont->CalcTextSizeA(sohHudSize, FLT_MAX, 0.0f, sohHudBuf);
++            ImVec2 sohPos = ImVec2(ImGui::GetIO().DisplaySize.x - sohTs.x - 34.0f, 18.0f);
++            ImU32 sohCol = (sohHudTh >= 2)  ? IM_COL32(255, 102, 77, 242)
++                           : (sohHudTh == 1) ? IM_COL32(255, 204, 102, 230)
++                                             : IM_COL32(255, 255, 255, 217);
++            sohFg->AddText(sohFont, sohHudSize, ImVec2(sohPos.x + 2, sohPos.y + 2),
++                           IM_COL32(0, 0, 0, 200), sohHudBuf);
++            sohFg->AddText(sohFont, sohHudSize, sohPos, sohCol, sohHudBuf);
++        }
++    }
++    ImGui::Render();
++}
++
++void* Gui::Soh3DGetDrawData() {
++    return (void*)ImGui::GetDrawData();
++}
++
++void Gui::Soh3DFinishMenuFrame() {
++    ImGui::EndFrame();
++    CheckSaveCvars();
+ }
++#endif // __IOS__
+ 
+ void Gui::HandleMouseCapture() {
+     ImGuiWindowFlags flags = ImGuiWindowFlags_NoMouseInputs;

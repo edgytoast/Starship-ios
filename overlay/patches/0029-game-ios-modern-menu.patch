@@ -1,0 +1,60 @@
+Overlay patch 0029: wire and register the modern (mobile) iOS menu.
+
+The menu ITSELF is not in this patch. Like app/ios/SohIosShell.m (patch 0012),
+its ~2,300 lines live in the REPO at app/menu/ as reviewable source and are
+compiled in via -DSOH_IOS_MENU_DIR. That keeps the vendor delta to two small
+hunks in two files, which survives an upstream bump; inlining the menu would
+have made a ~2,300-line patch that nobody can review and that conflicts on
+every bump.
+
+The CMake wiring lives in patch 0012, which already owns the iOS app-target
+block — two patches editing that region break each other's applied-probe.
+This patch is therefore ImguiUI.cpp only (src/port/ui/ImguiUI.cpp): include + ~8 __IOS__-gated lines registering
+the menu as LUS's MENU via gui->SetMenu(). LUS already routes F1 to
+GetMenu()->ToggleVisibility() (Gui.cpp:544) and counts a registered menu in
+GetMenuOrMenubarVisible() (Gui.cpp:1059), so the shell's menu button,
+SohIos_IsMenuOpen and the touch router keep working unchanged.
+
+__IOS__-gated throughout: the macOS build keeps the upstream menubar.
+
+
+--- a/src/port/ui/ImguiUI.cpp
++++ b/src/port/ui/ImguiUI.cpp
+@@ -1,5 +1,8 @@
+ #include "ImguiUI.h"
+ #include "UIWidgets.h"
++#ifdef __IOS__
++#include "PortMenu.h" // SOH_IOS (overlay 0029): modern mobile menu (app/menu/)
++#endif
+ #include "ResolutionEditor.h"
+ 
+ #include <spdlog/spdlog.h>
+@@ -44,13 +47,28 @@
+ 
+     mGameMenuBar = std::make_shared<GameMenuBar>("gOpenMenuBar", CVarGetInteger("gOpenMenuBar", 0));
+     gui->SetMenuBar(mGameMenuBar);
++#ifdef __IOS__
++    // SOH_IOS (overlay 0029): register the modern menu as LUS's MENU (not the
++    // menubar). LUS routes F1 to GetMenu()->ToggleVisibility() and counts a
++    // registered menu in GetMenuOrMenubarVisible(), so the shell's menu
++    // button, SohIos_IsMenuOpen and the touch router need no changes. The
++    // menubar stays registered but hidden; desktop/oracle are untouched.
++    // Its OWN visibility CVar: sharing gOpenMenuBar with the menubar made both
++    // toggle together, so the old menubar drew behind the new menu.
++    GameUI::mPortMenu = std::make_shared<GameUI::PortMenu>("gSohIos.OpenMenu", "Starship");
++    gui->SetMenu(GameUI::mPortMenu);
++    mGameMenuBar->Hide();
++    CVarSetInteger("gOpenMenuBar", 0);
++#endif
+ 
+     if (gui->GetMenuBar() && !gui->GetMenuBar()->IsVisible()) {
+ #if defined(__SWITCH__) || defined(__WIIU__)
+         Notification::Emit({ .message = "Press - to access enhancements menu", .remainingTime = 10.0f });
+ #else
++#ifndef __IOS__
+         Notification::Emit({ .message = "Press F1 to access enhancements menu", .remainingTime = 10.0f });
+ #endif
++#endif
+     }
+ 
+     mStatsWindow = gui->GetGuiWindow("Stats");

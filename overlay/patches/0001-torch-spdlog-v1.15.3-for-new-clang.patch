@@ -1,0 +1,19 @@
+Overlay patch 0001: bump Torch's fetched spdlog to v1.15.3.
+Torch standalone (TorchExternal, USE_STANDALONE=ON) FetchContents spdlog at
+7e635fca (~1.12, bundled fmt 10) whose fmt fails under this Mac's clang
+(macOS 27 toolchain): "call to consteval function ... is not a constant
+expression" in fmt_helper.h. Upstream CI never sees it (macos-14 runners).
+v1.15.3 bundles a consteval-clean fmt. Host-tool only — the torch LIBRARY
+linked into the game uses find_package(spdlog) and is unaffected.
+
+--- a/tools/Torch/CMakeLists.txt
++++ b/tools/Torch/CMakeLists.txt
+@@ -227,7 +227,7 @@
+ 	FetchContent_Declare(
+ 		spdlog
+ 		GIT_REPOSITORY https://github.com/gabime/spdlog.git
+-		GIT_TAG 7e635fca68d014934b4af8a1cf874f63989352b7
++		GIT_TAG 6fa36017cfd5731d617e1a934f0e5ea9c4445b13 # v1.15.3: old bundled fmt breaks under clang 17 consteval
+ 	)
+ 
+ 	FetchContent_MakeAvailable(spdlog)

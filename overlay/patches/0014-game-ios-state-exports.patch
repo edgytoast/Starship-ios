@@ -1,0 +1,89 @@
+Overlay patches 0014 + 0015 (game-side iOS).
+
+0014 (rev2): shell-contract exports appended at EOF of src/port/Engine.cpp
+(reference 0013 pattern; symbol names verbatim). rev2 adds
+SohIos_IsTitleOrDemo (SF64: gGameState != GSTATE_PLAY) and the mouse-free
+menu-scroll queue (SohIos_QueueMenuScroll from the shell,
+SohIos_TakeMenuScrollFor consumed by overlay 0019's menus):
+  SohIos_IsMenuOpen    — LUS Gui menubar visibility (touch overlay auto-hide)
+  SohIos_IsGamePaused  — gPlayState == PLAY_PAUSE (controller-mode menu dot)
+  SohIos_ActiveSeqIds  — BGM|fanfare<<16 from sActiveSequences (music diag)
+  SohIos_IsPopupOpen   — any ImGui popup (overlay popup-yield)
+
+--- a/src/port/Engine.cpp
++++ b/src/port/Engine.cpp
+@@ -56,6 +56,7 @@
+ #include <sf64thread.h>
+ #include <macros.h>
+ #include "sf64audio_provisional.h"
++#include "audioseq_cmd.h"
+ void AudioThread_CreateNextAudioBuffer(int16_t* samples, uint32_t num_samples);
+ }
+ 
+@@ -844,5 +845,66 @@
+             MemoryPool.erase(it);
+             break;
+         }
++    }
++}
++
++#ifdef __IOS__
++// SOH_IOS (overlay 0014): game-state exports for the iOS app shell
++// (app/ios/SohIosShell.m). Names kept reference-verbatim (harbour-shell).
++#include <imgui.h>
++
++extern "C" s32 gPlayState;
++
++extern "C" int SohIos_IsMenuOpen(void) {
++    auto gui = Ship::Context::GetInstance()->GetWindow()->GetGui();
++    return (gui != nullptr && gui->GetMenuOrMenubarVisible()) ? 1 : 0;
++}
++
++extern "C" int SohIos_IsGamePaused(void) {
++    return gPlayState == PLAY_PAUSE ? 1 : 0;
++}
++
++extern "C" ActiveSequence sActiveSequences[];
++
++extern "C" uint32_t SohIos_ActiveSeqIds(void) {
++    // low 16 = BGM player's active seqId, high 16 = fanfare player's.
++    return (uint32_t)(sActiveSequences[SEQ_PLAYER_BGM].seqId & 0xFFFF) |
++           ((uint32_t)(sActiveSequences[SEQ_PLAYER_FANFARE].seqId & 0xFFFF) << 16);
++}
++
++extern "C" int SohIos_IsPopupOpen(void) {
++    return (ImGui::GetCurrentContext() != nullptr &&
++            ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel))
++               ? 1
++               : 0;
++}
++
++extern "C" GameState gGameState;
++
++extern "C" int SohIos_IsTitleOrDemo(void) {
++    // "Not flying": title/menu/map/logo/boot/game-over — states where the
++    // shell's ≡ menu button stays visible even in controller mode.
++    return gGameState != GSTATE_PLAY ? 1 : 0;
++}
++
++#include <atomic>
++static std::atomic<float> sSohIosScrollX{ 0.0f };
++static std::atomic<float> sSohIosScrollDy{ 0.0f };
++
++// Shell -> game: finger scroll queue for the open menu (mouse-free; wheel
++// injection caused hover tooltips + slider side-effects on the Ship of Harkinian port).
++extern "C" void SohIos_QueueMenuScroll(float x, float dy) {
++    sSohIosScrollX.store(x);
++    sSohIosScrollDy.store(sSohIosScrollDy.load() + dy);
++}
++
++// Consumed by ImguiUI's menus (overlay 0019): takes the whole queued delta
++// iff the finger is horizontally inside the given window span.
++extern "C" float SohIos_TakeMenuScrollFor(float winX, float winW) {
++    float x = sSohIosScrollX.load();
++    if (x < winX || x > winX + winW) {
++        return 0.0f;
+     }
++    return sSohIosScrollDy.exchange(0.0f);
+ }
++#endif

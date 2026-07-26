@@ -1,0 +1,29 @@
+Wire the iOS app shell into LUS (reference 0012, rebased): LUS calls
+SohIos_OnWindowCreated right after SDL creates its window. The shell lives
+in the Starship-ios repo (passed as -DSOH_IOS_SHELL_DIR). Symbol name kept
+reference-verbatim for harbour-shell uniformity.
+
+--- a/libultraship/src/graphic/Fast3D/backends/gfx_sdl2.cpp
++++ b/libultraship/src/graphic/Fast3D/backends/gfx_sdl2.cpp
+@@ -46,6 +46,10 @@
+ #endif
+ 
+ namespace Fast {
++#ifdef __IOS__
++// iOS app shell hook (overlay 0009), implemented in app/ios/SohIosShell.m.
++extern "C" void SohIos_OnWindowCreated(struct SDL_Window*);
++#endif
+ const SDL_Scancode lus_to_sdl_table[] = {
+     SDL_SCANCODE_UNKNOWN,
+     SDL_SCANCODE_ESCAPE,
+@@ -369,6 +373,10 @@
+     }
+ 
+     mWnd = SDL_CreateWindow(title, posX, posY, mWindowWidth, mWindowHeight, flags);
++#ifdef __IOS__
++    // Graft onto the active UIWindowScene, force landscape, host touch controls.
++    SohIos_OnWindowCreated(mWnd);
++#endif
+ #ifdef _WIN32
+     // Get Windows window handle and use it to subclass the window procedure.
+     // Needed to circumvent SDLs DPI scaling problems under windows (original does only scale *sometimes*).

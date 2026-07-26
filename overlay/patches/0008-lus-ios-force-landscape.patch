@@ -1,0 +1,18 @@
+Lock iOS to landscape (reference 0011, rebased): set
+SDL_HINT_ORIENTATIONS before SDL_Init so SDL's iOS view controller reports
+landscape-only and iOS rotates the UI to match; Info.plist agrees.
+
+--- a/libultraship/src/graphic/Fast3D/backends/gfx_sdl2.cpp
++++ b/libultraship/src/graphic/Fast3D/backends/gfx_sdl2.cpp
+@@ -319,6 +319,11 @@
+     SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
+ #endif
+ 
++#ifdef __IOS__
++    // Force landscape so iOS rotates the device to match the game's landscape
++    // drawable (otherwise it renders sideways in a portrait window).
++    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
++#endif
+     SDL_Init(SDL_INIT_VIDEO);
+ 
+     SDL_EventState(SDL_DROPFILE, SDL_ENABLE);

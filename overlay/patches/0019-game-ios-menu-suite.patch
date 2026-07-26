@@ -1,0 +1,227 @@
+Overlay patch 0019: the iOS menu suite in Starship's menubar (SYNC WAVE 1;
+reference 0017/0018 shapes adapted to this port's UIWidgets menu framework).
+- Settings -> iOS submenu: Touch Controls (Double-Tap Z to Lock — default
+  OFF per the Starship judgement call, D8; Haptics; Opacity; Left-Handed;
+  Stick Response; Customize Layout...), Display (Max Frame Rate 60/120,
+  Performance HUD), Menu (Menu Scale, LIVE), Advanced (Remote Console).
+- LIVE menu scale: per-frame ratio-apply of gSohIos.MenuScale against the
+  boot value LUS applied at Gui init (overlay 0010) — bootstrap-on-first-
+  frame, so no LUS revision is needed.
+- Mouse-free swipe-scroll: each top-level menubar dropdown consumes the
+  shell's queued deltas (SohIos_TakeMenuScrollFor, overlay 0014 rev2) when
+  the finger is horizontally inside it — SetScrollY on the popup window
+  itself (Starship's dropdowns are plain ImGui windows; no internals).
+- iOS quit: menu Quit freezes with Close() alone (no desktop loop to
+  unwind) -> CVarSave + exit(0) (reference batch-4 root cause).
+
+--- a/src/port/ui/ImguiUI.cpp
++++ b/src/port/ui/ImguiUI.cpp
+@@ -230,8 +230,50 @@
+     ImGui::SetCursorScreenPos(ImVec2(canvasPos.x, canvasPos.y + canvasSize.y + 10));
+ }
+ 
++#ifdef __IOS__
++// SOH_IOS (overlay 0019): shell-contract helpers for the phone UI.
++#include <cmath>
++extern "C" float SohIos_TakeMenuScrollFor(float winX, float winW);
++
++// Finger swipes queued by the shell (overlay 0014 rev2) scroll the menu
++// dropdown under the finger. Mouse-free: no hover tooltips, no slider
++// side-effects (reference device feedback).
++static void SohIosUi_ApplyMenuScroll() {
++    float dy = SohIos_TakeMenuScrollFor(ImGui::GetWindowPos().x, ImGui::GetWindowSize().x);
++    if (dy != 0.0f) {
++        ImGui::SetScrollY(ImGui::GetScrollY() - dy);
++    }
++}
++
++// LIVE menu scale: LUS applied gSohIos.MenuScale once at Gui init (overlay
++// 0010). Track the applied value — bootstrapped from the CVar on the first
++// frame, before the slider can move — and ratio-scale the live ImGui style
++// whenever it changes. FontGlobalScale is absolute; style paddings scale by
++// ratio (the Ship of Harkinian port ScaleImGui approach).
++static void SohIosUi_MenuScaleLive() {
++    static float sohIosApplied = 0.0f;
++    float want = CVarGetFloat("gSohIos.MenuScale", 0.85f);
++    want = want < 0.6f ? 0.6f : (want > 1.2f ? 1.2f : want);
++    if (sohIosApplied == 0.0f) {
++        sohIosApplied = want; // boot value: already applied at Gui init
++        return;
++    }
++    if (fabsf(want - sohIosApplied) > 0.001f) {
++        ImGui::GetStyle().ScaleAllSizes(want / sohIosApplied);
++        ImGui::GetIO().FontGlobalScale = want;
++        sohIosApplied = want;
++    }
++}
++#endif
++
+ void DrawSettingsMenu(){
++#ifdef __IOS__
++    SohIosUi_MenuScaleLive();
++#endif
+     if(UIWidgets::BeginMenu("Settings")){
++#ifdef __IOS__
++        SohIosUi_ApplyMenuScroll();
++#endif
+         if (UIWidgets::BeginMenu("Audio")) {
+             UIWidgets::CVarSliderFloat("Master Volume", "gGameMasterVolume", 0.0f, 1.0f, 1.0f, {
+                 .format = "%.0f%%",
+@@ -357,16 +399,98 @@
+ 
+             UIWidgets::CVarCheckbox("Invert Y Axis", "gInvertYAxis",{
+                 .tooltip = "Inverts the Y axis for controlling vehicles"
++            });
++
++            ImGui::EndMenu();
++        }
++
++#ifdef __IOS__
++        // SOH_IOS (overlay 0019): phone-specific settings (reference 0017
++        // shape, adapted to Starship's menubar). The touch overlay lives in
++        // the app shell (SohIosShell.m); these CVars are its knobs (consumed
++        // live by the shell's 0.25 s poll unless noted).
++        UIWidgets::Spacer(0);
++        if (UIWidgets::BeginMenu("iOS")) {
++            ImGui::SeparatorText("Touch Controls");
++            UIWidgets::CVarCheckbox("Hold Z to Lock", "gSohIos.HoldToLock", {
++                .tooltip = "Hold the on-screen Z (brake) for 0.6 s and it LOCKS held — a short buzz "
++                           "confirms — until you tap it again. A normal braking tap never reaches 0.6 s, "
++                           "so it cannot fire by accident. On by default (matches the other ports). "
++                           "Physical controllers are unaffected.",
++                .defaultValue = true
++            });
++            UIWidgets::CVarCheckbox("Double-Tap Z to Lock", "gSohIos.ZDoubleTap", {
++                .tooltip = "A second way to lock Z: double-tap it within 0.35 s. Off by default — on "
++                           "SF64 the brake is something you tap constantly, so the hold gesture above "
++                           "is the safer one. Both can be on at once.",
++                .defaultValue = false
++            });
++            static const char* sohIosHapticsOptions[] = { "Off", "Light", "Strong" };
++            UIWidgets::CVarCombobox("Haptic Feedback", "gSohIos.Haptics", sohIosHapticsOptions, {
++                .tooltip = "Vibration when touch buttons are pressed.",
++                .defaultIndex = 1
++            });
++            UIWidgets::CVarSliderFloat("Touch Control Opacity", "gSohIos.TouchOpacity", 0.3f, 1.0f, 1.0f, {
++                .tooltip = "How visible the on-screen controls are during play.",
++                .format = "%.0f%%",
++                .isPercentage = true
+             });
++            UIWidgets::CVarCheckbox("Left-Handed Layout", "gSohIos.LeftyFlip", {
++                .tooltip = "Mirrors all touch controls left<->right (custom layouts mirror too)."
++            });
++            static const char* sohIosCurveOptions[] = { "Linear", "Precise (Expo)" };
++            UIWidgets::CVarCombobox("Stick Response", "gSohIos.StickCurve", sohIosCurveOptions, {
++                .tooltip = "Linear: deflection maps 1:1. Precise: finer control near the center, same maximum.",
++                .defaultIndex = 0
++            });
++            if (UIWidgets::MenuItem("Customize Layout...")) {
++                CVarSetInteger("gSohIos.EditLayout", 1);
++            }
+ 
++            ImGui::SeparatorText("Display");
++            UIWidgets::CVarSliderFloat("Supersampling (SSAA)", "gSohIos.Supersample", 1.0f, 2.0f, 1.0f, {
++                .tooltip = "Renders the game above native resolution and downsamples for smoother edges. "
++                           "1.0x = exactly native (the correct baseline — before this the game rendered "
++                           "BELOW native and upscaled). 2.0x is much sharper if your device has the GPU "
++                           "headroom; watch the Performance HUD. Applies immediately.",
++                .format = "%.2fx"
++            });
++            static const char* sohIosFpsOptions[] = { "60 fps", "120 fps" };
++            UIWidgets::CVarCombobox("Max Frame Rate", "gSohIos.MaxFps", sohIosFpsOptions, {
++                .tooltip = "How fast the game runs on this device. 120 fps uses the full ProMotion "
++                           "panel; 60 fps saves battery. On iOS THIS setting decides the frame rate — "
++                           "the Graphics menu's FPS slider and Match Refresh Rate are ignored here "
++                           "(overlay 0020 rev2).",
++                .defaultIndex = 1
++            });
++            UIWidgets::CVarCheckbox("Performance HUD", "gSohIos.PerfHud", {
++                .tooltip = "Small fps + thermal readout in the top-right corner."
++            });
++
++            ImGui::SeparatorText("Menu");
++            UIWidgets::CVarSliderFloat("Menu Scale", "gSohIos.MenuScale", 0.6f, 1.2f, 0.85f, {
++                .tooltip = "Size of this menu and its text. Applies immediately.",
++                .format = "%.0f%%",
++                .isPercentage = true
++            });
++
++            ImGui::SeparatorText("Advanced");
++            UIWidgets::CVarCheckbox("Remote Console", "gSohIos.RemoteConsole", {
++                .tooltip = "Opens a TCP debug console on port 8767 while the app runs, reachable from "
++                           "your local network. Leave off unless troubleshooting."
++            });
+             ImGui::EndMenu();
+         }
++#endif
+ 
+         ImGui::EndMenu();
+     }
+ 
+     ImGui::SetCursorPosY(0.0f);
+     if (UIWidgets::BeginMenu("Graphics")) {
++#ifdef __IOS__
++        SohIosUi_ApplyMenuScroll();
++#endif
+         UIWidgets::WindowButton("Resolution Editor", "gAdvancedResolutionEditorEnabled", GameUI::mAdvancedResolutionSettingsWindow);
+ 
+         UIWidgets::Spacer(0);
+@@ -563,6 +687,9 @@
+ 
+ void DrawGameMenu() {
+     if (UIWidgets::BeginMenu("Starship")) {
++#ifdef __IOS__
++        SohIosUi_ApplyMenuScroll();
++#endif
+         if (UIWidgets::MenuItem("Reset", "F4")) {
+             gNextGameState = GSTATE_BOOT;
+         }
+@@ -575,6 +702,18 @@
+ 
+         if (UIWidgets::MenuItem("Quit")) {
+             Ship::Context::GetInstance()->GetWindow()->Close();
++#ifdef __IOS__
++            // SOH_IOS (overlay 0019): Close() alone freezes on iOS — there is
++            // no desktop loop to unwind (reference batch-4 root cause). Flush
++            // config, JOIN THE AUDIO WORKER, then exit. Without AudioExit the
++            // global audio std::thread is still joinable when exit(0) runs
++            // static destructors -> ~thread() calls std::terminate -> abort
++            // (found by crash.txt on the sim; Starship-specific — the audio
++            // worker is a game-side global here, unlike SoH).
++            CVarSave();
++            GameEngine::AudioExit();
++            exit(0);
++#endif
+         }
+         ImGui::EndMenu();
+     }
+@@ -590,6 +729,9 @@
+ 
+ void DrawEnhancementsMenu() {
+     if (UIWidgets::BeginMenu("Enhancements")) {
++#ifdef __IOS__
++        SohIosUi_ApplyMenuScroll();
++#endif
+ 
+         if (UIWidgets::BeginMenu("Gameplay")) {
+             UIWidgets::CVarCheckbox("No Level of Detail (LOD)", "gDisableLOD", {
+@@ -726,6 +868,9 @@
+ 
+ void DrawCheatsMenu() {
+     if (UIWidgets::BeginMenu("Cheats")) {
++#ifdef __IOS__
++        SohIosUi_ApplyMenuScroll();
++#endif
+         UIWidgets::CVarCheckbox("Infinite Lives", "gInfiniteLives");
+         UIWidgets::CVarCheckbox("Invincible", "gInvincible");
+         UIWidgets::CVarCheckbox("Unbreakable Wings", "gUnbreakableWings");
+@@ -783,6 +928,9 @@
+ 
+ void DrawDebugMenu() {
+     if (UIWidgets::BeginMenu("Developer")) {
++#ifdef __IOS__
++        SohIosUi_ApplyMenuScroll();
++#endif
+         if (UIWidgets::CVarCombobox("Log Level", "gDeveloperTools.LogLevel", logLevels, {
+             .tooltip = "The log level determines which messages are printed to the "
+                         "console. This does not affect the log file output",

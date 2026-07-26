@@ -1,0 +1,39 @@
+Overlay patch 0016: stop the game's directory-scoped include list from
+shadowing subprojects' own headers. include_directories() propagates into
+every add_subdirectory target created after it — including libzip,
+FetchContent'd INSIDE libultraship on iOS — and LUS's C++
+src/config/config.h then shadows libzip's generated config.h for
+zipint.h's `#include "config.h"` ("fatal error: 'vector' file not found"
+compiling zip_winzip_aes.c, iOS sim build). Remove both (duplicated)
+src/config entries from the global list and scope that dir to the game
+target only. Platform-independent (the oracle re-verifies after).
+
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -276,14 +276,12 @@
+   ${CMAKE_CURRENT_SOURCE_DIR}/libultraship/src/menu
+   ${CMAKE_CURRENT_SOURCE_DIR}/libultraship/src/utils
+   ${CMAKE_CURRENT_SOURCE_DIR}/libultraship/src/utils/binarytools
+-  ${CMAKE_CURRENT_SOURCE_DIR}/libultraship/src/config
+   ${CMAKE_CURRENT_SOURCE_DIR}/libultraship/src/resource
+   ${CMAKE_CURRENT_SOURCE_DIR}/libultraship/src/resource/type
+   ${CMAKE_CURRENT_SOURCE_DIR}/libultraship/src/resource/factory
+   ${CMAKE_CURRENT_SOURCE_DIR}/libultraship/src/audio
+   ${CMAKE_CURRENT_SOURCE_DIR}/libultraship/src/window
+   ${CMAKE_CURRENT_SOURCE_DIR}/libultraship/src/window/gui
+-  ${CMAKE_CURRENT_SOURCE_DIR}/libultraship/src/config
+   ${CMAKE_CURRENT_SOURCE_DIR}/libultraship/src/public
+   ${CMAKE_CURRENT_SOURCE_DIR}/libultraship/src/public/libultra
+   ${CMAKE_CURRENT_SOURCE_DIR}/libultraship/src/public/bridge
+@@ -298,6 +296,11 @@
+   ${GLEW_INCLUDE_DIRS}
+   ${dr_libs_SOURCE_DIR}
+ )
++# libultraship/src/config is deliberately NOT in the directory-scoped list
++# above: directory includes propagate into add_subdirectory targets (libzip
++# is FetchContent'd inside LUS on iOS), where LUS's C++ config.h shadows
++# libzip's own generated config.h. Scope it to the game target only.
++target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/libultraship/src/config)
+ 
+ add_subdirectory(libultraship ${CMAKE_CURRENT_SOURCE_DIR}/libultraship)
+ add_dependencies(${PROJECT_NAME} libultraship)

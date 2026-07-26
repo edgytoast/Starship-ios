@@ -1,0 +1,129 @@
+Overlay patch 0021 (rev2, +mips): Metal UploadTexture hardening + mip chains.
+SYNC WAVE 1 shipped clamp + null-guard + byte ledger (reference 0019 rev2).
+SYNC WAVE 2 adds deferred mip-chain generation (reference 0019 rev3/rev4):
+- (a) Clamp dimensions to GetMaxTextureSize — Metal ABORTS the process past
+  the device limit; Fast3D's OOB-load fallback flattens over-requested
+  texture-pack loads into degenerate single-line uploads (16384x1+). Source
+  stride kept so the clamped region reads row-correct.
+- (b) newTexture returns nil under memory pressure — skip, don't deref.
+- (c) mip chains for >=256 px textures (single-level minified sampling of
+  2048px+ pack textures is a bandwidth catastrophe — reference measured
+  31 ms GPU frames in vista scenes, 3.8 ms with mips). Mip generation is
+  DEFERRED: the texture is retained onto sSohIosPendingMips, and EndFrame
+  (overlay 0024) runs ONE generateMipmaps blit on the frame's own command
+  buffer. Per-upload mid-frame command buffers deadlock past ~64/frame
+  behind the enqueue()d-but-uncommitted frame buffer (reference's Hyrule
+  Field freeze). Ledger is mip-aware (+1/3 for a full chain).
+Ships even though SF64 has no pack ecosystem yet (SYNC WAVE 1/2 mandate:
+these are what make packs safe). Compiles with 0022 (ledger member) +
+0024 (EndFrame blit consumes sSohIosPendingMips).
+
+--- a/libultraship/src/graphic/Fast3D/backends/gfx_metal.cpp
++++ b/libultraship/src/graphic/Fast3D/backends/gfx_metal.cpp
+@@ -329,16 +329,49 @@
+     mCurrentTile = tile;
+     mCurrentTextureIds[tile] = texture_id;
+ }
++
++// SOH_IOS (overlay 0021 rev2): textures awaiting a mip-chain build in
++// EndFrame's single blit pass (overlay 0024). Entries are retained on push —
++// the 0022 byte-budget cache may evict (release) a texture before the frame
++// ends.
++static std::vector<MTL::Texture*> sSohIosPendingMips;
+ 
+ void GfxRenderingAPIMetal::UploadTexture(const uint8_t* rgba32_buf, uint32_t width, uint32_t height) {
++    if (width == 0 || height == 0) {
++        return;
++    }
++
++    // SOH_IOS (overlay 0021): Metal aborts the process (no error return) if a
++    // texture dimension exceeds the device limit. The interpreter's OOB-load
++    // fallback flattens over-requested texture-pack loads into a single line
++    // (e.g. 65536x1), which trips that limit. Clamp and log instead of dying;
++    // the flattened bytes past the clamp are zero-fill/garbage by
++    // construction. bytes_per_row keeps the SOURCE stride so a clamped region
++    // stays row-correct.
++    const uint32_t sohIosSrcWidth = width;
++    const uint32_t sohIosMaxDim = (uint32_t)GetMaxTextureSize();
++    if (width > sohIosMaxDim || height > sohIosMaxDim) {
++        SPDLOG_WARN("UploadTexture: clamping oversized texture {}x{} to device max {}", width, height, sohIosMaxDim);
++        width = width > sohIosMaxDim ? sohIosMaxDim : width;
++        height = height > sohIosMaxDim ? sohIosMaxDim : height;
++    }
++
+     TextureDataMetal* texture_data = &mTextures[mCurrentTextureIds[mCurrentTile]];
+ 
+     NS::AutoreleasePool* autorelease_pool = NS::AutoreleasePool::alloc()->init();
+ 
++    // SOH_IOS (overlay 0021 rev2): HD/pack textures were uploaded single-level;
++    // minified sampling of 2048px+ textures is a memory-bandwidth catastrophe
++    // (reference: 31ms GPU frames in vista scenes -> 3.8ms with mips). Give
++    // large textures a full mip chain; tiny native-N64 textures stay
++    // single-level (mip-gen overhead isn't worth it there).
++    const bool sohIosWantMips = (width >= 256 || height >= 256);
+     MTL::TextureDescriptor* texture_descriptor =
+-        MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatRGBA8Unorm, width, height, true);
++        MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatRGBA8Unorm, width, height, sohIosWantMips);
+     texture_descriptor->setArrayLength(1);
+-    texture_descriptor->setMipmapLevelCount(1);
++    if (!sohIosWantMips) {
++        texture_descriptor->setMipmapLevelCount(1);
++    }
+     texture_descriptor->setSampleCount(1);
+     texture_descriptor->setStorageMode(MTL::StorageModeShared);
+ 
+@@ -346,18 +379,51 @@
+ 
+     MTL::Texture* texture = texture_data->texture;
+     if (texture_data->texture == nullptr || texture_data->texture->width() != width ||
+-        texture_data->texture->height() != height) {
+-        if (texture_data->texture != nullptr)
++        texture_data->texture->height() != height ||
++        (sohIosWantMips && texture_data->texture->mipmapLevelCount() <= 1)) {
++        if (texture_data->texture != nullptr) {
++            // SOH_IOS (overlay 0021 rev2): keep the GPU byte ledger exact (a mip
++            // chain adds one third over the base level).
++            size_t sohIosOldBytes = (size_t)texture_data->texture->width() * texture_data->texture->height() * 4;
++            if (texture_data->texture->mipmapLevelCount() > 1) {
++                sohIosOldBytes += sohIosOldBytes / 3;
++            }
++            mTextureBytes -= sohIosOldBytes;
+             texture_data->texture->release();
++            texture_data->texture = nullptr;
++        }
+ 
+         texture = mDevice->newTexture(texture_descriptor);
++        // SOH_IOS (overlay 0021): under memory pressure newTexture returns nil;
++        // the unchecked replaceRegion below then dereferenced null. Skip the
++        // upload (stale/garbage texel data beats a crash) and log loudly.
++        if (texture == nullptr) {
++            SPDLOG_ERROR("UploadTexture: newTexture failed ({}x{}, {} MB resident) — skipping upload", width,
++                         height, mTextureBytes / (1024 * 1024));
++            autorelease_pool->release();
++            return;
++        }
++        size_t sohIosNewBytes = (size_t)width * height * 4;
++        if (texture->mipmapLevelCount() > 1) {
++            sohIosNewBytes += sohIosNewBytes / 3;
++        }
++        mTextureBytes += sohIosNewBytes;
+     }
+ 
+     NS::UInteger bytes_per_pixel = 4;
+-    NS::UInteger bytes_per_row = bytes_per_pixel * width;
++    NS::UInteger bytes_per_row = bytes_per_pixel * sohIosSrcWidth; // SOURCE stride (overlay 0021)
+     texture->replaceRegion(region, 0, rgba32_buf, bytes_per_row);
+     texture_data->texture = texture;
+ 
++    // SOH_IOS (overlay 0021 rev2): DO NOT create a command buffer here — the
++    // frame's command buffer is already enqueue()d and uncommitted, so buffers
++    // created mid-frame stack up behind it unexecuted; >63 uploads in one frame
++    // deadlocks commandBuffer(). Defer to EndFrame's single blit pass (0024).
++    if (sohIosWantMips && texture->mipmapLevelCount() > 1) {
++        texture->retain();
++        sSohIosPendingMips.push_back(texture);
++    }
++
+     autorelease_pool->release();
+ }
+ 

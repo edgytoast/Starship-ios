@@ -1,0 +1,82 @@
+Overlay patch 0024: Metal EndFrame — GPU frame time + deferred mip blit.
+SYNC WAVE 2 items 2+3, both of which land in EndFrame's screen-command-buffer
+tail within a few lines of each other, so per D6 they are ONE hunk (one patch
+owns this region).
+- GPU frame time (reference 0028): sample the screen command buffer's
+  GPUEndTime-GPUStartTime via addCompletedHandler into gSohIosGpuMs (defined
+  in the shell). The perf probe's eng_ms includes present blocking and can't
+  separate GPU saturation from pacing waits. File-scope extern "C" — block-
+  scope linkage specs don't compile in C++ (reference trap). Fork note:
+  Starship's metal-cpp takes a bare lambda (matches this file's existing
+  addCompletedHandler use), not the Ship of Harkinian port MTL::HandlerFunction wrapper.
+- Deferred mip blit (reference 0019 rev4): build mip chains for this frame's
+  uploads (queued by 0021 rev2 onto sSohIosPendingMips) in ONE generateMipmaps
+  blit pass on the frame's own command buffer, after render encoding ends and
+  before present. Per-upload mid-frame command buffers deadlock past ~64/frame
+  (Hyrule Field freeze); one deferred pass is the fix. The command buffer
+  retains encoder-referenced textures until completion, so the list retain is
+  dropped right after encoding (including textures 0021's cache already
+  evicted).
+
+--- a/libultraship/src/graphic/Fast3D/backends/gfx_metal.cpp
++++ b/libultraship/src/graphic/Fast3D/backends/gfx_metal.cpp
+@@ -32,6 +32,16 @@
+ #include <spdlog/spdlog.h>
+ #include <spdlog/fmt/fmt.h>
+ 
++#ifdef __IOS__
++// SOH_IOS (overlay 0024): true GPU frame time (ms), defined in the app
++// shell; C linkage (the shell is ObjC). File scope — block-scope linkage
++// specs don't compile in C++. sSohIosPendingMips is defined in this TU by
++// overlay 0021 (UploadTexture).
++extern "C" {
++extern volatile float gSohIosGpuMs;
++}
++#endif
++
+ #include "gfx_metal_shader.h"
+ 
+ #include "libultraship/libultra/abi.h"
+@@ -655,8 +665,42 @@
+ 
+     auto screen_framebuffer = mFramebuffers[0];
+     screen_framebuffer.mCommandEncoder->endEncoding();
++    // SOH_IOS (overlay 0024): build mip chains for this frame's uploads
++    // (overlay 0021 rev2) in ONE blit pass on the frame's own command
++    // buffer — per-upload command buffers deadlock past ~64/frame. Mips
++    // become valid next frame; the one frame that samples fresh uploads
++    // pre-mips is a load transition. sSohIosPendingMips is the file-scope
++    // static defined above by overlay 0021 (UploadTexture). UNCONDITIONAL:
++    // the push in UploadTexture is unconditional, so the drain must be too
++    // (the macOS build uses this Metal backend — a gated drain would leak
++    // + leave mip levels ungenerated, garbage under 0025's mip sampler).
++    if (!sSohIosPendingMips.empty()) {
++        if (screen_framebuffer.mCommandBuffer != nullptr) {
++            MTL::BlitCommandEncoder* sohIosBlit = screen_framebuffer.mCommandBuffer->blitCommandEncoder();
++            for (MTL::Texture* sohIosTex : sSohIosPendingMips) {
++                sohIosBlit->generateMipmaps(sohIosTex);
++            }
++            sohIosBlit->endEncoding();
++        }
++        for (MTL::Texture* sohIosTex : sSohIosPendingMips) {
++            sohIosTex->release();
++        }
++        sSohIosPendingMips.clear();
++    }
+     screen_framebuffer.mCommandBuffer->presentDrawable(mCurrentDrawable);
+     mCurrentVertexBufferPoolIndex = (mCurrentVertexBufferPoolIndex + 1) % kMaxVertexBufferPoolSize;
++#ifdef __IOS__
++    // SOH_IOS (overlay 0024): true GPU duration of the frame's screen pass
++    // — eng_ms includes present blocking and cannot separate GPU
++    // saturation from pacing waits. Cached; the `drawable` bridge command
++    // and perf probe read it without ever blocking on the GPU.
++    screen_framebuffer.mCommandBuffer->addCompletedHandler([](MTL::CommandBuffer* cb) {
++        double ms = (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
++        if (ms > 0 && ms < 1000.0) {
++            gSohIosGpuMs = (float)ms;
++        }
++    });
++#endif
+     screen_framebuffer.mCommandBuffer->commit();
+ 
+     mDrawnFramebuffers.clear();

@@ -1,0 +1,22 @@
+LUS Context: on iOS GetAppBundlePath returned $HOME/Documents,
+conflating the read-only bundle with the writable data dir (reference 0005,
+rebased — the __IOS__ early-return lives inside GetAppBundlePath here).
+starship.o2r + the Torch extraction manifests ship in the bundle;
+sf64.o2r/config/saves/mods stay in Documents.
+
+--- a/libultraship/src/Context.cpp
++++ b/libultraship/src/Context.cpp
+@@ -406,8 +406,11 @@
+ #endif
+ 
+ #ifdef __IOS__
+-    const char* home = getenv("HOME");
+-    return std::string(home) + "/Documents";
++    // Read-only resources (starship.o2r, config.yml + assets/yaml for the
++    // extractor) live in the signed app bundle; the writable side
++    // (GetAppDirectoryPath) remains Documents.
++    FolderManager iosFolderManager;
++    return iosFolderManager.getMainBundlePath();
+ #endif
+ 
+ #ifdef NON_PORTABLE

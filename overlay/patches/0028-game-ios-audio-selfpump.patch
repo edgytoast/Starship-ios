@@ -1,0 +1,143 @@
+Overlay patch 0028: THE sibling-wide fuzzy-audio fix — SYNC WAVE 2 addendum B
+(2ship 0024, device-confirmed 2026-07-19). Starship's GameEngine::HandleAudioThread
+is the OLD coupled loop: a plain cv_to_thread.wait() that produces audio ONLY
+on the game loop's per-tick notify. On iOS the game loop IS the UIKit main
+thread, so touch-event/redraw bursts (a pressed thumb delivers up to 120 Hz)
+delay the notify past the ring's headroom -> the SDL backend drains -> crackle
+("fuzzy audio", every sibling except SoH, whose upstream already evolved this
+loop). Starship's report is always-on fuzz (STARSHIP QUARANTINE) — the audio
+path, not the input path.
+Fix: port SoH's loop shape — QoS user-interactive on the audio thread + 5 ms
+self-pump (wait_for) + producer guard + pre-buffer reservoir — preserving
+Starship's processing/cv_from_thread handshake and its DYNAMIC channel count
+(GetNumAudioChannels, not a fixed 2). CRITICAL degeneracy check (addendum B):
+Starship inits DesiredBuffered=1680 (context->Init {32000,1024,1680,...}) —
+same regime as 2S2H, where SoH's `Buffered + burst <= Desired` formula
+allowed production only under ~96 samples (WORSE than unfixed). Gate on the
+documented intent instead: produce while `Buffered <= Desired` (skip-when-
+above; overshoot bounded to one burst). Tracks min/max buffered into atomics
+the 0017 rev4 probe reports as aud_min/aud_max (0 = underrun; the retest
+instrument). __IOS__-gated: the macOS build keeps the pristine loop.
+
+--- a/src/port/Engine.cpp
++++ b/src/port/Engine.cpp
+@@ -359,8 +359,101 @@
+ 
+ extern "C" unsigned short samples_high = SAMPLES_HIGH;
+ extern "C" unsigned short samples_low = SAMPLES_LOW;
++
++#ifdef __IOS__
++#include <atomic>
++#include <chrono>
++#if defined(__APPLE__)
++#include <pthread/qos.h>
++#endif
++// SOH_IOS (overlay 0028): min/max backend-buffered samples seen this report
++// window (read/reset by the 0017 probe). File scope, same TU as the probe.
++std::atomic<int32_t> sSohIosAudMinBuffered{ INT32_MAX };
++std::atomic<int32_t> sSohIosAudMaxBuffered{ -1 };
++#endif
++
++#define AUDIO_FRAMES_PER_UPDATE (gVIsPerFrame > 0 ? gVIsPerFrame : 1)
++#define MAX_AUDIO_FRAMES_PER_UPDATE 5 // Compile-time constant with max value of gVIsPerFrame
+ 
+ void GameEngine::HandleAudioThread() {
++#ifdef __IOS__
++    // SOH_IOS (overlay 0028, SYNC WAVE 2 addendum B): explicit user-interactive
++    // QoS so touch/redraw bursts on the main (game) thread can't starve audio.
++    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
++    // Produce one update's worth and hand it to the SDL backend. Starship's
++    // channel count is DYNAMIC (surround), so size for the max and read it
++    // per call.
++    auto sohIosProduceAndPlay = [&](u32 num_audio_samples) {
++        static thread_local s16 audio_buffer[SAMPLES_HIGH * MAX_NUM_AUDIO_CHANNELS * MAX_AUDIO_FRAMES_PER_UPDATE];
++        const int32_t num_audio_channels = GetNumAudioChannels();
++        for (int i = 0; i < AUDIO_FRAMES_PER_UPDATE; i++) {
++            AudioThread_CreateNextAudioBuffer(audio_buffer + i * (num_audio_samples * num_audio_channels),
++                                              num_audio_samples);
++        }
++        AudioPlayerPlayFrame((u8*) audio_buffer,
++                             num_audio_samples * (sizeof(int16_t) * num_audio_channels * AUDIO_FRAMES_PER_UPDATE));
++    };
++    // Self-pump: also wake on a short timeout, independent of the gfx frame
++    // rate (closer to the console, where the audio task ran off the scheduler
++    // rather than gated on rendering).
++    constexpr auto kSelfPumpInterval = std::chrono::milliseconds(5);
++    bool primed = false; // wait for the game to reach its render loop first
++    while (audio.running) {
++        bool wasProcessing = false;
++        {
++            std::unique_lock<std::mutex> Lock(audio.mutex);
++            if (!primed) {
++                while (!audio.processing && audio.running) {
++                    audio.cv_to_thread.wait(Lock);
++                }
++                primed = true;
++            } else if (!audio.processing && audio.running) {
++                audio.cv_to_thread.wait_for(Lock, kSelfPumpInterval);
++            }
++            if (!audio.running) {
++                break;
++            }
++            wasProcessing = audio.processing;
++        }
++        {
++            std::unique_lock<std::mutex> Lock(audio.mutex);
++            int samples_left = AudioPlayerBuffered();
++            int32_t prevMin = sSohIosAudMinBuffered.load();
++            while (samples_left < prevMin && !sSohIosAudMinBuffered.compare_exchange_weak(prevMin, samples_left)) {
++            }
++            int32_t prevMax = sSohIosAudMaxBuffered.load();
++            while (samples_left > prevMax && !sSohIosAudMaxBuffered.compare_exchange_weak(prevMax, samples_left)) {
++            }
++            u32 num_audio_samples =
++                samples_left < AudioPlayerGetDesiredBuffered() ? (((samples_high))) : (((samples_low)));
++            frames++;
++            if (frames > 60) {
++                countermin++;
++            }
++            // Producer guard (addendum B rev2): produce while at-or-below
++            // Desired (skip-when-above). SoH's exact formula
++            // (Buffered + burst <= Desired) DEGENERATES here — Starship inits
++            // DesiredBuffered=1680, so it would allow production only under one
++            // burst and the ring hits empty every cycle. Overshoot is bounded
++            // to one burst, well under the backend's refusal threshold.
++            if (AudioPlayerBuffered() <= AudioPlayerGetDesiredBuffered()) {
++                sohIosProduceAndPlay(num_audio_samples);
++            }
++            if (wasProcessing) {
++                audio.processing = false;
++                audio.cv_from_thread.notify_one();
++            }
++        }
++        // Pre-buffer reservoir: fill to Desired — absorbs main-thread load
++        // spikes (the BGM sequencer advances independently of gameplay).
++        while (audio.running && AudioPlayerBuffered() < AudioPlayerGetDesiredBuffered()) {
++            int samples_left = AudioPlayerBuffered();
++            u32 num_audio_samples =
++                samples_left < AudioPlayerGetDesiredBuffered() ? (((samples_high))) : (((samples_low)));
++            sohIosProduceAndPlay(num_audio_samples);
++        }
++    }
++#else
+ #ifdef PIPE_DEBUG
+     std::ofstream outfile("audio.bin", std::ios::binary | std::ios::app);
+ #endif
+@@ -377,9 +470,6 @@
+ 
+         // gVIsPerFrame = 2;
+ 
+-#define AUDIO_FRAMES_PER_UPDATE (gVIsPerFrame > 0 ? gVIsPerFrame : 1)
+-#define MAX_AUDIO_FRAMES_PER_UPDATE 5 // Compile-time constant with max value of gVIsPerFrame
+-
+         std::unique_lock<std::mutex> Lock(audio.mutex);
+         int samples_left = AudioPlayerBuffered();
+         u32 num_audio_samples = samples_left < AudioPlayerGetDesiredBuffered() ? (((samples_high))) : (((samples_low)));
+@@ -412,6 +502,7 @@
+ #ifdef PIPE_DEBUG
+     outfile.close();
+ #endif
++#endif
+ }
+ 
+ void GameEngine::StartAudioFrame() {

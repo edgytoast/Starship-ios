@@ -1,0 +1,30 @@
+# Pristine upstream — reconstructed by scripts/bootstrap.sh (the pin lives there)
+/vendor/
+
+# Build trees
+/oracle/build-cmake/
+/build-ios/
+
+# Oracle runtime home — extracted game data (user's ROM-derived), config, saves
+/oracle/shiphome/
+
+# User game data — never committed, never deleted
+/work/
+
+# Heavy artifacts (screenshots/logs referenced from MEASUREMENTS.md stay small;
+# traces and video do not belong in git)
+/artifacts/*.trace
+/artifacts/*.mov
+/artifacts/*.mp4
+/artifacts/*.log
+
+.DS_Store
+
+# Spike build trees
+/spikes/
+
+# Device build tree + staged OTA payloads (ipa is a build artifact; the
+# staging dir is reproduced by scripts/publish-ota.sh)
+/build-ios/
+/ota/*/starship.ipa
+build-visionos/

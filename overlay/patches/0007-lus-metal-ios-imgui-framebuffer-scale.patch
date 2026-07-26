@@ -1,0 +1,28 @@
+The iOS BLACK-SCREEN / corner-render fix (reference 0010, rebased).
+On __APPLE__ the game reaches fb 0 as an ImGui::Image; the SDL2 ImGui
+backend (no SDL_Renderer) derives FramebufferScale from
+SDL_GL_GetDrawableSize = POINTS on iOS, so the RenderDrawData size guard
+skips the whole pass -> solid black. Recompute scale from the drawable's
+real pixels; DisplaySize stays in points so the menu keeps its size.
+
+--- a/libultraship/src/graphic/Fast3D/backends/gfx_metal.cpp
++++ b/libultraship/src/graphic/Fast3D/backends/gfx_metal.cpp
+@@ -114,6 +114,18 @@
+ 
+     // Workaround for detecting when transitioning to/from full screen mode.
+     MTL::Texture* screen_texture = mTextures[framebuffer.mTextureId].texture;
++#ifdef __IOS__
++    // The ImGui SDL2 backend was init'd for Metal (no SDL_Renderer) so it derives
++    // FramebufferScale from SDL_GL_GetDrawableSize, which returns POINTS on iOS
++    // (scale ends up 1x). Recompute it from the real drawable pixels so
++    // DisplaySize(points)*scale == drawable, or the game image is skipped (black)
++    // / drawn into the top-left corner. reference overlay 0010.
++    if (drawData->DisplaySize.x > 0.0f && drawData->DisplaySize.y > 0.0f) {
++        drawData->FramebufferScale =
++            ImVec2((float)screen_texture->width() / drawData->DisplaySize.x,
++                   (float)screen_texture->height() / drawData->DisplaySize.y);
++    }
++#endif
+     int fb_width = (int)(drawData->DisplaySize.x * drawData->FramebufferScale.x);
+     int fb_height = (int)(drawData->DisplaySize.y * drawData->FramebufferScale.y);
+     if (screen_texture->width() != fb_width || screen_texture->height() != fb_height)

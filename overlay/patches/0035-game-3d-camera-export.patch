@@ -1,0 +1,117 @@
+Generate 0035-game-3d-camera-export.patch.
+
+SF64 game-side exports for stereoscopic 3D (0034 consumes them). SF64 has no
+z_view/Camera class — it composes the gameplay view with a global
+Matrix_LookAt(gPlayCamEye, gPlayCamAt, playerCamUp) in fox_display.c.
+
+- Edit 1 (fox_display.c, after the LookAt): export the camera basis
+  (eye/fwd/right, P00, dist) so 0034 folds the eye offset in the CAMERA basis
+  (the combined view*projection can't be decomposed). Plus comfort flags:
+  gSoh3DPaused (PLAY_PAUSE) and gSoh3DCinematic (cutscene/transition — level
+  intro/complete, warp, 360, boss moments, ending) which eases stereo depth
+  toward a hardcoded 15% while set. This block runs ONLY in GSTATE_PLAY
+  (Display_Update is the DRAW_PLAY draw path).
+
+- Edit 2 (fox_game.c, in Game_Update — device round 4): the AUTHORITATIVE
+  per-frame stereo gate. Because edit 1 only runs during play, gSoh3DInPlay
+  would stay STALE at 1 on the map / menu / game-over / results screens after
+  a level, leaving those "world progress" screens rendering in 3D
+  (disorienting — user report). Game_Update runs for EVERY game state, so
+  setting gSoh3DInPlay = (gGameState == GSTATE_PLAY) here forces those screens
+  flat (0034 fades separation to 0 when !InPlay). Also exports gGameState for
+  the `3d` bridge telemetry.
+
+Device round 4 removed the per-object Arwing depth sentinels (0x5C/0x5D
+around the player draws): the fold demonstrably reached the ship
+(objFold telemetry) but the reduction was not perceivable on-device, so per
+the user we stopped targeting the ship and let the single overall Depth
+slider compensate. The 0034 objSepMul machinery is now inert (no sentinels
+emit) and harmless.
+
+fox_display.c / fox_game.c are C (no extern "C"); sqrtf/tanf already used
+in-file. __IOS__-guarded so the macOS build compiles this vendor and links
+no shell.
+
+--- a/src/engine/fox_display.c
++++ b/src/engine/fox_display.c
+@@ -1946,6 +1946,57 @@
+     Matrix_Push(&gGfxMatrix);
+     Matrix_LookAt(gGfxMatrix, gPlayCamEye.x, gPlayCamEye.y, gPlayCamEye.z, gPlayCamAt.x, gPlayCamAt.y, gPlayCamAt.z,
+                   playerCamUp.x, playerCamUp.y, playerCamUp.z, MTXF_APPLY);
++#ifdef __IOS__
++    // SOH_IOS (overlay 0035): export the camera basis for stereoscopic 3D (0034)
++    // at the exact values Matrix_LookAt consumed.
++    {
++        extern volatile float gSoh3DCamDist, gSoh3DCamP00;
++        extern volatile float gSoh3DCamRight[3], gSoh3DCamFwd[3], gSoh3DCamEye[3];
++        extern volatile int gSoh3DPaused, gSoh3DInPlay, gSoh3DCinematic;
++        extern f32 gFovY;
++        f32 sohFx = gPlayCamAt.x - gPlayCamEye.x;
++        f32 sohFy = gPlayCamAt.y - gPlayCamEye.y;
++        f32 sohFz = gPlayCamAt.z - gPlayCamEye.z;
++        f32 sohDist = sqrtf(sohFx * sohFx + sohFy * sohFy + sohFz * sohFz);
++        if (sohDist > 0.0f) {
++            sohFx /= sohDist;
++            sohFy /= sohDist;
++            sohFz /= sohDist;
++            f32 sohRx = sohFy * playerCamUp.z - sohFz * playerCamUp.y;
++            f32 sohRy = sohFz * playerCamUp.x - sohFx * playerCamUp.z;
++            f32 sohRz = sohFx * playerCamUp.y - sohFy * playerCamUp.x;
++            f32 sohRl = sqrtf(sohRx * sohRx + sohRy * sohRy + sohRz * sohRz);
++            if (sohRl > 1e-4f) {
++                gSoh3DCamRight[0] = sohRx / sohRl;
++                gSoh3DCamRight[1] = sohRy / sohRl;
++                gSoh3DCamRight[2] = sohRz / sohRl;
++                gSoh3DCamFwd[0] = sohFx;
++                gSoh3DCamFwd[1] = sohFy;
++                gSoh3DCamFwd[2] = sohFz;
++                gSoh3DCamEye[0] = gPlayCamEye.x;
++                gSoh3DCamEye[1] = gPlayCamEye.y;
++                gSoh3DCamEye[2] = gPlayCamEye.z;
++                f32 sohHalfFovX =
++                    tanf(gFovY * 0.5f * (3.14159265f / 180.0f)) * ((f32) SCREEN_WIDTH / (f32) SCREEN_HEIGHT);
++                gSoh3DCamP00 = (sohHalfFovX > 1e-4f) ? (1.0f / sohHalfFovX) : 1.0f;
++                gSoh3DCamDist = sohDist;
++            }
++        }
++        gSoh3DPaused = (gPlayState == PLAY_PAUSE);
++        gSoh3DInPlay = (gGameState == GSTATE_PLAY);
++        // Cutscene/transition detection. SF64 has no cutscene game-state, but
++        // cinematic moments live in gPlayer[0].state (plus the ending). 0034
++        // eases stereo depth toward a hardcoded 15% while set. U_TURN (a
++        // gameplay somersault) is deliberately excluded.
++        gSoh3DCinematic = (gGameState == GSTATE_ENDING) ||
++                          (gPlayer[0].state == PLAYERSTATE_LEVEL_INTRO) ||
++                          (gPlayer[0].state == PLAYERSTATE_LEVEL_COMPLETE) ||
++                          (gPlayer[0].state == PLAYERSTATE_ENTER_WARP_ZONE) ||
++                          (gPlayer[0].state == PLAYERSTATE_START_360) ||
++                          (gPlayer[0].state == PLAYERSTATE_GFOX_REPAIR) ||
++                          (gPlayer[0].state == PLAYERSTATE_ANDROSS_MOUTH);
++    }
++#endif
+ 
+     if ((gLevelType == LEVELTYPE_PLANET) || (gCurrentLevel == LEVEL_BOLSE)) {
+         if ((gCurrentLevel == LEVEL_TITANIA) &&
+--- a/src/engine/fox_game.c
++++ b/src/engine/fox_game.c
+@@ -352,6 +352,20 @@
+     CALL_EVENT(GamePreUpdateEvent);
+ 
+     Game_SetGameState();
++#ifdef __IOS__
++    // SOH_IOS (overlay 0035, device round 4): authoritative per-frame stereo
++    // gate. The camera export above runs ONLY in GSTATE_PLAY (Display_Update is
++    // the DRAW_PLAY path), so gSoh3DInPlay would stay STALE at 1 on the map /
++    // menu / game-over / results screens after a level and leave those "world
++    // progress" screens in 3D (disorienting). Game_Update runs for every state,
++    // so set it here so 0034 fades separation to 0 (flat) whenever we're not in
++    // gameplay. gSoh3DDbgGameState feeds the `3d` bridge telemetry.
++    {
++        extern volatile int gSoh3DInPlay, gSoh3DDbgGameState;
++        gSoh3DInPlay = (gGameState == GSTATE_PLAY);
++        gSoh3DDbgGameState = gGameState;
++    }
++#endif
+     if (gGameStandby) {
+         Game_InitStandbyDL(&gUnkDisp1);
+         gGameStandby = false;

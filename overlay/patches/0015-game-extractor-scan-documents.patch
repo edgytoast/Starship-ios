@@ -1,0 +1,69 @@
+Overlay patch 0015 (rev2): GameExtractor::SelectGameFromUI on iOS scanned nothing — it
+hardcoded Documents/baserom.us.rev1.z64. Scan the app directory (Documents —
+the Files-app drop-in target, UIFileSharingEnabled) for any *.z64 whose sha1
+is in the supported list; when the scan comes up empty, present the shell's
+BLOCKING native document picker once and rescan (the extraction flow runs
+pre-SDL-window, so the picker spins its own runloop like SDL's dialogs; a
+fresh install otherwise dead-ends in "No ROM selected" — device report
+2026-07-11). Android/Switch keep the fixed-name path.
+
+--- a/src/port/extractor/GameExtractor.cpp
++++ b/src/port/extractor/GameExtractor.cpp
+@@ -1,6 +1,13 @@
+ #include "GameExtractor.h"
+ 
+ #include <fstream>
++#include <filesystem>
++#include <algorithm>
++#ifdef __IOS__
++// Shell-provided blocking ROM picker (linkage specs must live at file
++// scope, not inside a function — reference trap).
++extern "C" int SohIos_PickRomBlocking(void);
++#endif
+ 
+ #include "Context.h"
+ #include "spdlog/spdlog.h"
+@@ -32,6 +39,43 @@
+     }
+ 
+     this->mGamePath = selection[0];
++#elif defined(__IOS__)
++    // SOH_IOS (overlay 0015 rev2): scan the app directory (Documents — the
++    // Files-app drop-in target) for any *.z64 whose hash is supported,
++    // instead of requiring the magic name baserom.us.rev1.z64. If nothing is
++    // found, present the shell's BLOCKING native document picker once (this
++    // whole flow runs pre-SDL-window, so the picker must spin its own
++    // runloop exactly like SDL's message boxes do) and rescan — without it,
++    // a fresh install with an empty Documents dead-ends in "No ROM selected"
++    // (device report, 2026-07-11).
++    for (int sohIosAttempt = 0; sohIosAttempt < 2; sohIosAttempt++) {
++        for (const auto& entry : std::filesystem::directory_iterator(Ship::Context::GetAppDirectoryPath())) {
++            if (!entry.is_regular_file()) {
++                continue;
++            }
++            std::string ext = entry.path().extension().string();
++            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
++            if (ext != ".z64") {
++                continue;
++            }
++            std::ifstream candidate(entry.path(), std::ios::binary);
++            std::vector<uint8_t> data{ std::istreambuf_iterator(candidate), {} };
++            candidate.close();
++            const auto rom = new N64::Cartridge(data);
++            rom->Initialize();
++            bool supported = mGameList.find(rom->GetHash()) != mGameList.end();
++            delete rom;
++            if (supported) {
++                this->mGamePath = entry.path().string();
++                this->mGameData = std::move(data);
++                return true;
++            }
++        }
++        if (sohIosAttempt == 0 && !SohIos_PickRomBlocking()) {
++            break; // user cancelled the picker
++        }
++    }
++    return false;
+ #else
+     this->mGamePath = Ship::Context::GetPathRelativeToAppDirectory("baserom.us.rev1.z64");
+ #endif

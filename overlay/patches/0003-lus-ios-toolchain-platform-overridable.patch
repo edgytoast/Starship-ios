@@ -1,0 +1,18 @@
+Make LUS's iOS toolchain PLATFORM overridable (reference 0009 verbatim).
+ios-toolchain-populate.cmake hardcodes PLATFORM=OS64COMBINED, which forces
+the device sysroot and overrides -DCMAKE_OSX_SYSROOT=iphonesimulator — so
+simulator builds silently compile for device and fail at link. Simulator
+builds pass -DPLATFORM=SIMULATORARM64; device path unchanged.
+
+--- a/libultraship/cmake/ios-toolchain-populate.cmake
++++ b/libultraship/cmake/ios-toolchain-populate.cmake
+@@ -1,4 +1,8 @@
+-set(PLATFORM "OS64COMBINED")
++# Allow the caller to select the Apple platform (e.g. SIMULATORARM64 for a
++# simulator build); default to device+sim combined as before.
++if(NOT DEFINED PLATFORM)
++    set(PLATFORM "OS64COMBINED")
++endif()
+ include(FetchContent)
+ FetchContent_Declare(iostoolchain
+     GIT_REPOSITORY https://github.com/leetal/ios-cmake

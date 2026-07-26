@@ -1,0 +1,134 @@
+Overlay patch 0022: byte-budget texture cache (SYNC WAVE 1; reference 0020).
+Fast3D's texture cache is COUNT-based and the Metal backend's DeleteTexture
+was EMPTY — evicted ids park on a free list and the MTLTexture is only
+released if that id is later reused with different dims. Big texture packs
+pin gigabytes and jetsam at menu upload bursts after long sessions. Three
+parts (ships even though Starship has no pack ecosystem yet — SYNC WAVE 1
+mandate):
+1. gfx_rendering_api.h: virtual GetTextureBytes() (default 0 disables the
+   budget on other backends).
+2. Metal: DeleteTexture actually releases + exact byte ledger (created by
+   overlay 0021's UploadTexture accounting); GetTextureBytes reports.
+3. interpreter ImportTexture tail (__IOS__): after each upload, evict LRU
+   entries until resident bytes <= gSohIos.TexCacheBudgetMB (default 1536),
+   keeping >=128 entries. Draws are flushed before imports and command
+   buffers retain in-flight textures, so releasing at evict time is
+   GPU-safe — the same invariants the count eviction already relies on.
+
+--- a/libultraship/src/graphic/Fast3D/backends/gfx_rendering_api.h
++++ b/libultraship/src/graphic/Fast3D/backends/gfx_rendering_api.h
+@@ -68,6 +68,12 @@
+     virtual void* GetFramebufferTextureId(int fbId) = 0;
+     virtual void SelectTextureFb(int fbId) = 0;
+     virtual void DeleteTexture(uint32_t texId) = 0;
++    // SOH_IOS (overlay 0022): total bytes of live GPU textures created via
++    // UploadTexture. Backends without accounting report 0, which disables the
++    // interpreter's byte-budget eviction.
++    virtual size_t GetTextureBytes() {
++        return 0;
++    }
+     virtual void SetTextureFilter(FilteringMode mode) = 0;
+     virtual FilteringMode GetTextureFilter() = 0;
+     virtual void SetSrgbMode() = 0;
+--- a/libultraship/src/graphic/Fast3D/backends/gfx_metal.h
++++ b/libultraship/src/graphic/Fast3D/backends/gfx_metal.h
+@@ -155,6 +155,7 @@
+     void* GetFramebufferTextureId(int fbId) override;
+     void SelectTextureFb(int fbId) override;
+     void DeleteTexture(uint32_t texId) override;
++    size_t GetTextureBytes() override;
+     void SetTextureFilter(FilteringMode mode) override;
+     FilteringMode GetTextureFilter() override;
+     void SetSrgbMode() override;
+--- a/libultraship/src/graphic/Fast3D/backends/gfx_metal.h
++++ b/libultraship/src/graphic/Fast3D/backends/gfx_metal.h
+@@ -180,6 +180,9 @@
+         mShaderProgramPool;
+ 
+     std::vector<struct TextureDataMetal> mTextures;
++    // SOH_IOS (overlay 0022): exact resident bytes of the textures above
++    // (maintained by UploadTexture/DeleteTexture).
++    size_t mTextureBytes = 0;
+     std::vector<FramebufferMetal> mFramebuffers;
+     FrameUniforms mFrameUniforms;
+     CoordUniforms mCoordUniforms;
+--- a/libultraship/src/graphic/Fast3D/backends/gfx_metal.cpp
++++ b/libultraship/src/graphic/Fast3D/backends/gfx_metal.cpp
+@@ -323,6 +323,33 @@
+ }
+ 
+ void GfxRenderingAPIMetal::DeleteTexture(uint32_t texID) {
++    // SOH_IOS (overlay 0022): this was a no-op, so cache eviction never freed
++    // GPU memory (the MTLTexture lived until its id was reused with different
++    // dims). Command buffers retain in-flight resources, so releasing here is
++    // safe even if the GPU is still reading the texture this frame.
++    if (texID >= mTextures.size()) {
++        return;
++    }
++    TextureDataMetal* t = &mTextures[texID];
++    if (t->texture != nullptr) {
++        // SOH_IOS (overlay 0022 rev2): mip-aware — a full chain (0021 rev2) adds
++        // one third over the base level, matching UploadTexture's accounting.
++        size_t sohIosBytes = (size_t)t->texture->width() * t->texture->height() * 4;
++        if (t->texture->mipmapLevelCount() > 1) {
++            sohIosBytes += sohIosBytes / 3;
++        }
++        mTextureBytes -= sohIosBytes;
++        t->texture->release();
++        t->texture = nullptr;
++    }
++    if (t->msaaTexture != nullptr) {
++        t->msaaTexture->release();
++        t->msaaTexture = nullptr;
++    }
++}
++
++size_t GfxRenderingAPIMetal::GetTextureBytes() {
++    return mTextureBytes;
+ }
+ 
+ void GfxRenderingAPIMetal::SelectTexture(int tile, uint32_t texture_id) {
+--- a/libultraship/src/graphic/Fast3D/interpreter.cpp
++++ b/libultraship/src/graphic/Fast3D/interpreter.cpp
+@@ -966,6 +966,41 @@
+             SPDLOG_ERROR("Invalid texture format. Fmt = {}", fmt);
+             break;
+     }
++
++#ifdef __IOS__
++    // SOH_IOS (overlay 0022): the count cap alone lets big texture packs pin
++    // gigabytes (entries are up to 16-256 MB each) -> jetsam at menu upload
++    // bursts. Evict LRU entries until under the byte budget. Both
++    // currently-bound tiles were just touched (LRU back), and pending draws
++    // are flushed before imports, so the front is never referenced by
++    // unencoded work.
++    {
++        size_t sohIosBudget = (size_t)CVarGetInteger("gSohIos.TexCacheBudgetMB", 1536) * 1024 * 1024;
++        bool sohIosEvicted = false;
++        while (mRapi->GetTextureBytes() > sohIosBudget && mTextureCache.map.size() > 128) {
++            TextureCacheMap::iterator evictIt = mTextureCache.lru.front().it;
++            mRapi->DeleteTexture(evictIt->second.texture_id);
++            mTextureCache.free_texture_ids.push_back(evictIt->second.texture_id);
++            for (int j = 0; j < SHADER_MAX_TEXTURES; j++) {
++                if (mRenderingState.mTextures[j] == &*evictIt) {
++                    mRenderingState.mTextures[j] = nullptr;
++                }
++            }
++            mTextureCache.map.erase(evictIt);
++            mTextureCache.lru.pop_front();
++            sohIosEvicted = true;
++        }
++        if (sohIosEvicted) {
++            // Rate-limited so heavy streaming can't spam the log.
++            static uint32_t sohIosEvictLogCounter = 0;
++            if ((sohIosEvictLogCounter++ % 200) == 0) {
++                SPDLOG_INFO("texcache: evicted to {} MB / {} entries (budget {} MB)",
++                            mRapi->GetTextureBytes() / (1024 * 1024), mTextureCache.map.size(),
++                            sohIosBudget / (1024 * 1024));
++            }
++        }
++    }
++#endif
+ }
+ 
+ void Interpreter::ImportTextureMask(int i, int tile) {

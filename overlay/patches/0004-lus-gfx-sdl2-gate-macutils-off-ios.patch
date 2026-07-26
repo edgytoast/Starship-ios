@@ -1,0 +1,26 @@
+Gate the Cocoa macUtils fullscreen call sites off iOS (reference 0001,
+rebased; this fork has a second site — the HandleEvents fullscreen resync).
+macUtils.mm is Darwin-only in src/CMakeLists.txt:104-110, so these bare
+__APPLE__ blocks are undefined-symbol link errors on iOS. iOS is
+force-fullscreen anyway (Fast3dWindow gameMode).
+
+--- a/libultraship/src/graphic/Fast3D/backends/gfx_sdl2.cpp
++++ b/libultraship/src/graphic/Fast3D/backends/gfx_sdl2.cpp
+@@ -228,7 +228,7 @@
+         }
+     }
+ 
+-#if defined(__APPLE__)
++#if defined(__APPLE__) && !defined(__IOS__)
+     // Implement fullscreening with native macOS APIs
+     if (on != isNativeMacOSFullscreenActive(mWnd)) {
+         toggleNativeMacOSFullscreen(mWnd);
+@@ -611,7 +611,7 @@
+     }
+ 
+     // resync fullscreen state
+-#ifdef __APPLE__
++#if defined(__APPLE__) && !defined(__IOS__)
+     auto nextFullscreenState = isNativeMacOSFullscreenActive(mWnd);
+     if (mFullScreen != nextFullscreenState) {
+         mFullScreen = nextFullscreenState;

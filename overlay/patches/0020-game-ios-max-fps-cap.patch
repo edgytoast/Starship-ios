@@ -1,0 +1,54 @@
+Overlay patch 0020: Max Frame Rate cap in GetInterpolationFPS (SYNC WAVE 1;
+reference 0015 rev3 intent). gSohIos.MaxFps (0 = 60, 1 = 120, set from the
+iOS menu, overlay 0019) caps every path — the battery vs ProMotion knob.
+std::min via ternary so this hunk has no include dependency on 0017's
+<algorithm> (patch independence, D6 spirit). __IOS__-only; desktop build
+unchanged (the original body rides in the #else).
+
+--- a/src/port/Engine.cpp
++++ b/src/port/Engine.cpp
+@@ -728,7 +728,36 @@
+     last_update_rate = gVIsPerFrame;
+ }
+ 
++#ifdef __IOS__
++// SOH_IOS (overlay 0020 rev3): panel refresh straight from UIKit (shell).
++// File scope: a linkage specification is illegal inside a function body.
++extern "C" uint32_t SohIos_PanelMaxFps(void);
++#endif
++
+ uint32_t GameEngine::GetInterpolationFPS() {
++#ifdef __IOS__
++    // SOH_IOS (overlay 0020 rev3): the iOS "Max Frame Rate" knob
++    // (gSohIos.MaxFps: 0=60, 1=120) is AUTHORITATIVE. A phone panel is 60 or
++    // 120 Hz and nothing between is useful, so the interpolation target is
++    // just min(panel refresh, cap). Deliberately ignores gMatchRefreshRate
++    // and gInterpolationFPS: rev1 honoured them and a config with
++    // MatchRefreshRate=0 silently capped a 120 Hz phone at the
++    // gInterpolationFPS default of 60 (user report 2026-07-23). The Graphics
++    // menu's FPS slider therefore has no effect on iOS - the iOS menu owns it.
++    const uint32_t sohIosCap = CVarGetInteger("gSohIos.MaxFps", 1) == 0 ? 60 : 120;
++    // Panel truth from UIKit (shell), NOT LUS's GetCurrentRefreshRate(): that
++    // reads SDL's cached display mode, which is the remaining suspect for a
++    // 120 Hz phone being paced at 60. Fall back to the engine's value, then
++    // to 60, if UIKit gives nothing plausible.
++    uint32_t sohIosRefresh = SohIos_PanelMaxFps();
++    if (sohIosRefresh < 30) {
++        sohIosRefresh = Ship::Context::GetInstance()->GetWindow()->GetCurrentRefreshRate();
++    }
++    if (sohIosRefresh < 30) {
++        sohIosRefresh = 60; // defensive: a 0/bogus refresh must never stall the loop
++    }
++    return sohIosRefresh < sohIosCap ? sohIosRefresh : sohIosCap;
++#else
+     if (CVarGetInteger("gMatchRefreshRate", 0)) {
+         return Ship::Context::GetInstance()->GetWindow()->GetCurrentRefreshRate();
+ 
+@@ -739,6 +768,7 @@
+     }
+ 
+     return CVarGetInteger("gInterpolationFPS", 60);
++#endif
+ }
+ 
+ uint32_t GameEngine::GetInterpolationFrameCount()

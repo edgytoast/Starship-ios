@@ -1,0 +1,28 @@
+Overlay patch 0033: size screen-pass attachments from the ACQUIRED drawable
+(VISION-PRO-LUS-PLAYBOOK Phase 01; = sibling ports' resize-drawable-truth).
+Vision Pro window-resize crash: the screen framebuffer setup receives the
+caller's cached width/height but binds the freshly acquired drawable as the
+color attachment. During a live resize the drawable's real size differs, so
+the depth texture (sized from stale values) mismatches -> Metal render-pass
+validation abort while dragging the window corner. The acquired drawable is
+ground truth — derive width/height from its texture. Benign on iPhone (sizes
+never change). Starship LUS path: src/graphic/Fast3D/backends/gfx_metal.cpp.
+
+--- a/libultraship/src/graphic/Fast3D/backends/gfx_metal.cpp
++++ b/libultraship/src/graphic/Fast3D/backends/gfx_metal.cpp
+@@ -929,6 +929,15 @@
+ 
+     tex.texture = mCurrentDrawable->texture();
+ 
++#ifdef __IOS__
++    // SOH_IOS (overlay 0033): during a live window resize (visionOS) the
++    // acquired drawable's size can differ from the caller's cached w/h; sizing
++    // the depth attachment from stale values makes the render-pass attachments
++    // mismatch -> Metal validation abort. The drawable is the ground truth.
++    width = (uint32_t)tex.texture->width();
++    height = (uint32_t)tex.texture->height();
++#endif
++
+     MTL::RenderPassDescriptor* render_pass_descriptor = MTL::RenderPassDescriptor::renderPassDescriptor();
+     render_pass_descriptor->colorAttachments()->object(0)->setTexture(tex.texture);
+     render_pass_descriptor->colorAttachments()->object(0)->setLoadAction(MTL::LoadActionLoad);

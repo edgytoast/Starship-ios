@@ -1,0 +1,99 @@
+Overlay patch 0038: full right-stick C-pad on the gamepad (device round 2).
+
+SF64's upstream default (Engine.cpp) binds the right stick to only TWO of the
+four C-buttons: UP->C-up (RIGHTY-) and RIGHT->C-right (RIGHTX+). C-down and
+C-left live on the triggers and the B/Y face buttons, NOT the stick — so on a
+physical controller pushing the right stick down or left does nothing ("only
+joystick right and up do anything"), and the game's "hit C-down!" prompts are
+unreachable by the stick. Make the right stick a full 4-way C-pad.
+
+Two edits, because LUS only applies game defaults to a controller that has NO
+saved config (ControlDeck::Init -> HasConfig ? ReloadAllMappingsFromConfig :
+AddDefaultMappings). An existing install has saved config, so a default change
+alone never reaches it.
+
+1. Engine.cpp default: add RIGHTX- -> C-left and RIGHTY+ -> C-down alongside the
+   existing trigger bindings (kept as alternates). Fresh installs, and anyone
+   who does "Reset controller to defaults", get the full C-pad.
+
+2. os.cpp one-time migration: right after the deck loads persisted config
+   (osContInit), add the same two SDL axis-direction mappings to port 1's
+   C-down / C-left buttons if a one-shot CVar guard is unset. The mapping IDs
+   are deterministic (P-B-SDLA-AD) so AddButtonMapping is idempotent; the guard
+   (gSohIos.CPadFull) means a user who later deletes a binding keeps it deleted.
+
+__IOS__-guarded (the migration is an iOS/visionOS device-feedback fix; the
+oracle keeps upstream behavior). Engine.cpp default change is unconditional —
+it is the game's intended default and harmless on desktop.
+
+
+--- a/libultraship/src/public/libultra/os.cpp
++++ b/libultraship/src/public/libultra/os.cpp
+@@ -1,6 +1,10 @@
+ #include "libultraship/libultraship.h"
+ #include <SDL2/SDL.h>
+ #include <ratio>
++#ifdef __IOS__
++#include "controller/controldevice/controller/mapping/sdl/SDLAxisDirectionToButtonMapping.h"
++#include "public/bridge/consolevariablebridge.h"
++#endif
+ 
+ // Establish a chrono duration for the N64 46.875MHz clock rate
+ typedef std::ratio<3000, 64> n64ClockRatio;
+@@ -31,6 +35,43 @@
+ 
+     Ship::Context::GetInstance()->GetControlDeck()->Init(controllerBits);
+ 
++#ifdef __IOS__
++    // SOH_IOS (overlay 0038, device round 2): the game default binds only
++    // right-stick UP->C-up and RIGHT->C-right; DOWN and LEFT are on the
++    // triggers/face buttons, so on a gamepad the right stick is only half a
++    // C-pad ("only up and right do anything"). Add DOWN->C-down and
++    // LEFT->C-left once, here — right after the deck loads persisted config, so
++    // it reaches EXISTING installs (Init only applies game defaults when there
++    // is NO saved config, so changing the default alone never does). Mapping
++    // IDs are deterministic -> AddButtonMapping is idempotent; the CVar guard
++    // lets a later user removal stick.
++    if (!CVarGetInteger("gSohIos.CPadFull", 0)) {
++        auto sohCtrl = Ship::Context::GetInstance()->GetControlDeck()->GetControllerByPort(0);
++        if (sohCtrl != nullptr) {
++            const struct {
++                CONTROLLERBUTTONS_T btn;
++                int32_t axis;
++                int32_t dir;
++            } sohCPad[] = {
++                { BTN_CDOWN, SDL_CONTROLLER_AXIS_RIGHTY, 1 },
++                { BTN_CLEFT, SDL_CONTROLLER_AXIS_RIGHTX, -1 },
++            };
++            for (const auto& sohM : sohCPad) {
++                auto sohBtn = sohCtrl->GetButton(sohM.btn);
++                if (sohBtn != nullptr) {
++                    auto sohMap =
++                        std::make_shared<Ship::SDLAxisDirectionToButtonMapping>(0, sohM.btn, sohM.axis, sohM.dir);
++                    sohBtn->AddButtonMapping(sohMap);
++                    sohMap->SaveToConfig();
++                    sohBtn->SaveButtonMappingIdsToConfig();
++                }
++            }
++        }
++        CVarSetInteger("gSohIos.CPadFull", 1);
++        CVarSave();
++    }
++#endif
++
+     return 0;
+ }
+ 
+--- a/src/port/Engine.cpp
++++ b/src/port/Engine.cpp
+@@ -153,8 +153,8 @@
+         std::unordered_map<Ship::StickIndex, std::vector<std::pair<Ship::Direction, SDL_GameControllerButton>>>(),
+         // SDLAxisDirectionToButtonMappings
+         std::unordered_map<CONTROLLERBUTTONS_T, std::vector<std::pair<SDL_GameControllerAxis, int32_t>>>{
+-            { BTN_CLEFT, { { SDL_CONTROLLER_AXIS_TRIGGERRIGHT, 1 } } },
+-            { BTN_CDOWN, { { SDL_CONTROLLER_AXIS_TRIGGERLEFT, 1 } } },
++            { BTN_CLEFT, { { SDL_CONTROLLER_AXIS_TRIGGERRIGHT, 1 }, { SDL_CONTROLLER_AXIS_RIGHTX, -1 } } },
++            { BTN_CDOWN, { { SDL_CONTROLLER_AXIS_TRIGGERLEFT, 1 }, { SDL_CONTROLLER_AXIS_RIGHTY, 1 } } },
+             { BTN_CUP, { { SDL_CONTROLLER_AXIS_RIGHTY, -1 } } },
+             { BTN_CRIGHT, { { SDL_CONTROLLER_AXIS_RIGHTX, 1 } } }
+         },

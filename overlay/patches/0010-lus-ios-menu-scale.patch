@@ -1,0 +1,23 @@
+iOS menu scale (reference 0015, rebased to this fork's CVar bridge —
+CVarGetFloat instead of Context::GetRawInstance, which doesn't exist here;
+same 2ship lesson). Mirrors upstream's Android 2x block right above.
+
+--- a/libultraship/src/window/gui/Gui.cpp
++++ b/libultraship/src/window/gui/Gui.cpp
+@@ -132,6 +132,16 @@
+     // Scale everything by 2 for Android
+     ImGui::GetStyle().ScaleAllSizes(2.0f);
+     mImGuiIo->FontGlobalScale = 2.0f;
++#endif
++
++#ifdef __IOS__
++    // SOH_IOS (reference overlay 0015): the menu at 1x point-scale is ~15% too
++    // large on a phone. gSohIos.MenuScale is the future in-menu slider hook.
++    {
++        float sohIosMenuScale = CVarGetFloat("gSohIos.MenuScale", 0.85f);
++        ImGui::GetStyle().ScaleAllSizes(sohIosMenuScale);
++        mImGuiIo->FontGlobalScale = sohIosMenuScale;
++    }
+ #endif
+ 
+     auto imguiIniPath = Context::GetPathRelativeToAppDirectory("imgui.ini");

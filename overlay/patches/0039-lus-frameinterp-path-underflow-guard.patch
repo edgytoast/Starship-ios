@@ -1,0 +1,64 @@
+Generate 0039-lus-frameinterp-path-underflow-guard.patch.
+
+Fix the device crash: `signal 11` in Object_DrawAll on Corneria boss death
+(all-range mode). The fault return address (Object_DrawAll + 264) sits right
+after `bl _FrameInterpolation_RecordOpenChild`, whose first act is
+`current_path.back()` — a deref that is UB (segfault) when current_path is
+empty.
+
+Root cause: `is_recording` can toggle MID-FRAME —
+FrameInterpolation_ShouldInterpolateFrame() sets it directly, and StartRecord
+leaves it false at the 20 fps interpolation bucket (the boss-death slowdown
+can dip there). Both RecordOpenChild and RecordCloseChild early-return when
+!is_recording, so if recording flips between a matched Open and Close, the
+push/pop go unbalanced. An extra Close then pops the ROOT path off
+current_path, leaving it empty, and the next RecordOpenChild/append derefs
+current_path.back() on an empty vector -> crash. The boss-death frame (many
+scenery360/actor/effect draws in the all-range branch) is where the imbalance
+surfaces.
+
+Fix (pristine LUS/port code, robustness only):
+- RecordCloseChild: NEVER pop the root. `if (current_path.size() <= 1)
+  return;` before the pop. The root must always remain (StartRecord relies on
+  it). Popping it is always a bug regardless of the imbalance source. Counts
+  the guard hits into gSoh3DDbgInterpGuard (bridge `3d`) so the fix can be
+  confirmed to have engaged on-device.
+- RecordOpenChild: belt-and-suspenders empty-check before the .back() deref.
+
+__IOS__-guards only the telemetry counter (defined in the shell); the guards
+themselves are unconditional so the macOS build gets the same safety.
+
+
+--- a/src/port/interpolation/FrameInterpolation.cpp
++++ b/src/port/interpolation/FrameInterpolation.cpp
+@@ -442,6 +442,10 @@
+ 
+ void FrameInterpolation_RecordOpenChild(const void* a, int b) {
+     if (!is_recording)
++        return;
++    // SOH_IOS (overlay 0039): defensive — never deref .back() on an empty
++    // current_path (see the pop guard in RecordCloseChild).
++    if (current_path.empty())
+         return;
+     label key = { a, b };
+     auto& m = current_path.back()->children[key];
+@@ -451,7 +455,19 @@
+ 
+ void FrameInterpolation_RecordCloseChild(void) {
+     if (!is_recording)
++        return;
++    // SOH_IOS (overlay 0039): NEVER pop the root. is_recording can toggle
++    // mid-frame, so an unbalanced Close would otherwise empty current_path and
++    // the next RecordOpenChild/append would deref .back() on an empty vector =
++    // signal 11 in Object_DrawAll (device: Corneria boss death). Guard hits are
++    // counted so the fix can be confirmed engaged over the `3d` bridge.
++    if (current_path.size() <= 1) {
++#ifdef __IOS__
++        extern volatile int gSoh3DDbgInterpGuard;
++        gSoh3DDbgInterpGuard = gSoh3DDbgInterpGuard + 1;
++#endif
+         return;
++    }
+     // append(Op::CloseChild);
+     if (has_inv_actor_mtx && current_path.size() == inv_actor_mtx_path_index) {
+         has_inv_actor_mtx = false;

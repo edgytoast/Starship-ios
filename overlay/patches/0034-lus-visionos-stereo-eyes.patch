@@ -1,0 +1,585 @@
+Overlay patch 0034: stereoscopic eye rendering for visionOS 3D
+(= sibling ports' 0044/reference 0031, rebased onto Starship's OLDER LUS layout
+src/graphic/Fast3D/; VISION-PRO-LUS-PLAYBOOK §2.4/§2.5).
+
+In 3D (gSoh3DMode, shell-owned) Fast3dWindow runs the interpreter TWICE per host
+frame (same game time) with an eye state that swaps mGameFb to a per-eye
+framebuffer and applies an off-axis stereo projection to PERSPECTIVE matrices
+only, folded in the SF64 camera basis exported by 0035. fb 0 (the hidden
+window's drawable) is never touched in 3D; EndFrameOffscreen commits the drawn
+framebuffers, rides 0024's pending-mip pass, and publishes eye textures ON GPU
+COMPLETION (double-buffered per eye — the compositor blit-copies with no
+cross-queue fence, the §2.4 device-only trap).
+
+Port deltas vs the sibling patch:
+- Starship LUS is the OLD layout: src/graphic/Fast3D/{interpreter,Fast3dWindow}
+  + src/graphic/Fast3D/backends/{gfx_metal,gfx_rendering_api}. Member names
+  (mDrawnFramebuffers, mHasEndedEncoding, mFrameAutoreleasePool,
+  sSohIosPendingMips, FramebufferMetal.*) match verbatim.
+- Context::GetRawInstance() -> GetInstance() (our fork has only that accessor).
+- SSAA gate: Starship's 0026 SSAA block (StartFrame, default 2.0) must NOT run
+  during an eye pass or the eye fb resizes twice/frame — gate on sSoh3DEye == 0.
+- v1 MENU STUB: the two-pass loop does NOT composite the menu into the eyes
+  (that needs the Gui split, a follow-up). 3D renders stereo; the menu stays
+  reachable in 2D. gpu-ms 0027 completion handler kept honest in 3D.
+
+Shell globals live in SohIosShell.m (linked on iPhone too, mode stays 0);
+__IOS__-guarded so the macOS build (which compiles this overlaid vendor) uses
+the base-class no-op virtuals. Camera basis + comfort flags come from 0035.
+
+
+--- a/libultraship/src/graphic/Fast3D/interpreter.h
++++ b/libultraship/src/graphic/Fast3D/interpreter.h
+@@ -365,6 +365,10 @@
+     void StartFrame();
+     void Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements);
+     void EndFrame();
++    // SOH_IOS (overlay 0034): stereoscopic eye passes (visionOS 3D).
++    void Soh3DSetEye(int eye);
++    void Soh3DEndEyePass(int eye);
++    int Soh3DGetEyeFb(int eye);
+     void HandleWindowEvents();
+     bool IsFrameReady();
+     bool ViewportMatchesRendererResolution();
+@@ -505,6 +509,13 @@
+ 
+     int mGameFb{};             // game_framebuffer;
+     int mGameFbMsaaResolved{}; // game_framebuffer_msaa_resolved;
++    // SOH_IOS (overlay 0034): per-eye framebuffers (double-buffered — the
++    // compositor blit-copies the published texture unfenced) + saved 2D state.
++    int mSoh3DEyeFb[2][2] = { { -1, -1 }, { -1, -1 } };
++    int mSoh3DPing = 0;
++    int mSoh3DSavedGameFb = -1;
++    uint32_t mSoh3DSavedW = 0, mSoh3DSavedH = 0;
++    float mSoh3DSavedAspect = 0.0f;
+ 
+     std::set<std::pair<float, float>> mGetPixelDepthPending; // get_pixel_depth_pending;
+     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff> mGetPixelDepthCached; // get_pixel_depth_cached;
+--- a/libultraship/src/graphic/Fast3D/interpreter.cpp
++++ b/libultraship/src/graphic/Fast3D/interpreter.cpp
+@@ -1093,7 +1093,88 @@
+     Interpreter::TransposedMatrixMul(coeffs, light_dir,
+                                      mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1]);
+     Interpreter::NormalizeVector(coeffs);
++}
++
++#ifdef __IOS__
++#include <CoreFoundation/CFBase.h>
++// SOH_IOS (overlay 0034): stereoscopic eye state. The shell owns the mode flag
++// and the publish targets (SohIosShell.m — linked on iPhone too, mode 0 there).
++extern "C" {
++extern volatile int gSoh3DMode;
++extern void* volatile gSoh3DEyeTexture[2];
++extern volatile int gSoh3DEyeFrames[2];
++extern volatile int gSoh3DEyeW, gSoh3DEyeH;
++extern volatile float gSoh3DCamDist, gSoh3DCamP00;
++extern volatile float gSoh3DCamRight[3], gSoh3DCamFwd[3], gSoh3DCamEye[3];
++extern volatile float gSoh3DDbgConv, gSoh3DDbgSep;
++extern volatile int gSoh3DDbgObjSep; // Arwing sentinel hit counter (round-2 verify)
++extern volatile int gSoh3DDbgObjFold; // perspective folds run WITH reduced ship mul (round-3 verify)
++extern volatile int gSoh3DPaused, gSoh3DAiming, gSoh3DInPlay, gSoh3DCinematic;
++extern volatile int gSoh3DDbg2DW, gSoh3DDbg2DH, gSoh3DDbgCurW, gSoh3DDbgCurH;
++}
++static int sSoh3DEye = 0;
++static float sSoh3DSep = 3.0f;
++static float sSoh3DConv = 300.0f;
++static float sSoh3DConvSmooth = 300.0f;
++static float sSoh3DPauseMix = 1.0f;
++static float sSoh3DAimMix = 0.0f;
++static int sSoh3DSkybox = 0;
++// SOH_IOS (overlay 0034, device round 2): per-object separation scale, driven
++// by DL sentinels 0x5C/0x5D around the player Arwing (fox_display.c, 0035) so
++// the near ship pops less without flattening the scene. Target fraction +
++// smoothed cinematic reduction are CVar-backed (read in Soh3DSetEye).
++static float sSoh3DObjSepMul = 1.0f;
++static float sSoh3DPlayerDepthFrac = 0.35f;
++static float sSoh3DCineMix = 0.0f;
++static float sSoh3DP[4][4];
++// Off-axis stereo for the COMBINED viewing*projection (SF64 composes
++// guPerspective*Matrix_LookAt in the projection slot). Camera axes come from
++// the game's export (0035). Camera shift: world translation -e*right folded in.
++// Convergence skew: clip_x += s*view_z, s = e*P00/C, zero parallax at the focus.
++// Perspective detect: the combined matrix's w-column top-3 is (+/-)forward.
++static void Soh3DStereoP(float out[4][4], const float in[4][4]) {
++    memcpy(out, in, sizeof(sSoh3DP));
++    float sohWx = in[0][3], sohWy = in[1][3], sohWz = in[2][3];
++    if (sohWx * sohWx + sohWy * sohWy + sohWz * sohWz < 0.25f) {
++        if (sSoh3DSkybox && sSoh3DEye != 0) {
++            const float sohE = (sSoh3DEye == 2 ? 1.0f : -1.0f) * 0.5f * sSoh3DSep * sSoh3DPauseMix;
++            if (sohE != 0.0f && sSoh3DConv > 0.0f) {
++                out[3][0] += (sohE * gSoh3DCamP00 / sSoh3DConv) * out[3][3];
++            }
++        }
++        return;
++    }
++    // sSoh3DObjSepMul (1.0 except between the Arwing sentinels) scales BOTH the
++    // camera-shift and the convergence skew below, so the ship's disparity
++    // shrinks uniformly — no depth-fighting within the model.
++    const float e = (sSoh3DEye == 2 ? 1.0f : -1.0f) * 0.5f * sSoh3DSep * sSoh3DPauseMix * sSoh3DObjSepMul;
++    if (e == 0.0f) {
++        return;
++    }
++    // round-3 verify: count perspective folds that ran while INSIDE the Arwing
++    // sentinel bracket (objSepMul != 1). If arwingHits climbs but this stays 0,
++    // no ship matrix loads between the sentinels -> the reduction never reaches
++    // the ship's vertices.
++    if (sSoh3DObjSepMul != 1.0f) {
++        gSoh3DDbgObjFold = gSoh3DDbgObjFold + 1;
++    }
++    if (!sSoh3DSkybox) {
++        const float dx = -e * gSoh3DCamRight[0];
++        const float dy = -e * gSoh3DCamRight[1];
++        const float dz = -e * gSoh3DCamRight[2];
++        for (int j = 0; j < 4; j++) {
++            out[3][j] += dx * out[0][j] + dy * out[1][j] + dz * out[2][j];
++        }
++    }
++    const float s = e * gSoh3DCamP00 / sSoh3DConv;
++    const float sohEyeF = gSoh3DCamEye[0] * gSoh3DCamFwd[0] + gSoh3DCamEye[1] * gSoh3DCamFwd[1] +
++                          gSoh3DCamEye[2] * gSoh3DCamFwd[2];
++    out[0][0] += s * gSoh3DCamFwd[0];
++    out[1][0] += s * gSoh3DCamFwd[1];
++    out[2][0] += s * gSoh3DCamFwd[2];
++    out[3][0] += s * -sohEyeF;
+ }
++#endif
+ 
+ void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
+     float matrix[4][4];
+@@ -1149,6 +1230,12 @@
+         }
+         mRsp->lights_changed = 1;
+     }
++#ifdef __IOS__
++    if (sSoh3DEye != 0) {
++        Soh3DStereoP(sSoh3DP, mRsp->P_matrix);
++        MatrixMul(mRsp->MP_matrix, mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1], sSoh3DP);
++    } else
++#endif
+     MatrixMul(mRsp->MP_matrix, mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1], mRsp->P_matrix);
+ }
+ 
+@@ -1157,6 +1244,13 @@
+         if (mRsp->modelview_matrix_stack_size > 0) {
+             --mRsp->modelview_matrix_stack_size;
+             if (mRsp->modelview_matrix_stack_size > 0) {
++#ifdef __IOS__
++                if (sSoh3DEye != 0) {
++                    Soh3DStereoP(sSoh3DP, mRsp->P_matrix);
++                    MatrixMul(mRsp->MP_matrix, mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1],
++                              sSoh3DP);
++                } else
++#endif
+                 MatrixMul(mRsp->MP_matrix, mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1],
+                           mRsp->P_matrix);
+             }
+@@ -2766,6 +2860,18 @@
+     const char* filename = (const char*)(cmd)->words.w1;
+     uint32_t p = C0(16, 8);
+     uint32_t l = C0(0, 16);
++#ifdef __IOS__
++    if (p == 0x5A) {
++        sSoh3DSkybox = 1;
++    } else if (p == 0x5B) {
++        sSoh3DSkybox = 0;
++    } else if (p == 0x5C) {
++        sSoh3DObjSepMul = sSoh3DPlayerDepthFrac; // enter player Arwing
++        gSoh3DDbgObjSep = gSoh3DDbgObjSep + 1;
++    } else if (p == 0x5D) {
++        sSoh3DObjSepMul = 1.0f; // leave player Arwing
++    }
++#endif
+     if (p == 7) {
+         g_exec_stack.openDisp(filename, l);
+     } else if (p == 8) {
+@@ -4354,6 +4460,20 @@
+         mRendersToFb = false;
+     }
+ 
++#ifdef __IOS__
++    // SOH_IOS (overlay 0034): an eye pass renders offscreen at the panel size
++    // regardless of the (hidden) window. SetEye(0) restores the saved 2D values.
++    if (sSoh3DEye != 0) {
++        uint32_t sohEw = gSoh3DEyeW > 0 ? (uint32_t)gSoh3DEyeW : 3840u;
++        uint32_t sohEh = gSoh3DEyeH > 0 ? (uint32_t)gSoh3DEyeH : 2160u;
++        mRendersToFb = true;
++        mCurDimensions.width = sohEw;
++        mCurDimensions.height = sohEh;
++        mCurDimensions.aspect_ratio = (float)sohEw / (float)sohEh;
++        mRapi->UpdateFramebufferParameters(mGameFb, sohEw, sohEh, 1, true, true, true, true);
++    }
++#endif
++
+     mFbActive = false;
+ }
+ 
+@@ -4367,6 +4487,16 @@
+ 
+     mCurMtxReplacements = &mtx_replacements;
+ 
++#ifdef __IOS__
++    sSoh3DSkybox = 0;
++    sSoh3DObjSepMul = 1.0f; // reset per Run — the Arwing sentinels re-arm it
++    gSoh3DDbg2DW = (int)mGfxCurrentWindowDimensions.width;
++    gSoh3DDbg2DH = (int)mGfxCurrentWindowDimensions.height;
++    gSoh3DDbgCurW = (int)mCurDimensions.width;
++    gSoh3DDbgCurH = (int)mCurDimensions.height;
++    // fb 0 is the screen — never touched in 3D (the hidden window's drawable).
++    if (sSoh3DEye == 0)
++#endif
+     mRapi->UpdateFramebufferParameters(0, mGfxCurrentWindowDimensions.width, mGfxCurrentWindowDimensions.height, 1,
+                                        false, true, true, !mRendersToFb);
+     mRapi->StartFrame();
+@@ -4402,6 +4532,11 @@
+     mGfxFrameBuffer = 0;
+     currentDir = std::stack<std::string>();
+ 
++#ifdef __IOS__
++    if (sSoh3DEye != 0 && mRendersToFb) {
++        mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mGameFb);
++    } else
++#endif
+     if (mRendersToFb) {
+         mRapi->StartDrawToFramebuffer(0, 1);
+         mRapi->ClearFramebuffer(true, true);
+@@ -4429,7 +4564,93 @@
+     mWapi->SwapBuffersBegin();
+     mRapi->FinishRender();
+     mWapi->SwapBuffersEnd();
++}
++
++#ifdef __IOS__
++// SOH_IOS (overlay 0034): eye-pass control. SetEye(1|2) swaps mGameFb to the
++// eye's framebuffer (created lazily); SetEye(0) restores 2D state.
++void Interpreter::Soh3DSetEye(int eye) {
++    if (eye == 0) {
++        if (mSoh3DSavedGameFb >= 0) {
++            mGameFb = mSoh3DSavedGameFb;
++        }
++        if (mSoh3DSavedW > 0) {
++            mCurDimensions.width = mSoh3DSavedW;
++            mCurDimensions.height = mSoh3DSavedH;
++            mCurDimensions.aspect_ratio = mSoh3DSavedAspect;
++        }
++        sSoh3DEye = 0;
++        return;
++    }
++    if (mSoh3DEyeFb[0][0] < 0) {
++        for (int sohE = 0; sohE < 2; sohE++) {
++            for (int sohB = 0; sohB < 2; sohB++) {
++                mSoh3DEyeFb[sohE][sohB] = mRapi->CreateFramebuffer();
++            }
++        }
++    }
++    if (eye == 1) {
++        mSoh3DPing ^= 1;
++    }
++    if (sSoh3DEye == 0) {
++        mSoh3DSavedGameFb = mGameFb;
++        mSoh3DSavedW = mCurDimensions.width;
++        mSoh3DSavedH = mCurDimensions.height;
++        mSoh3DSavedAspect = mCurDimensions.aspect_ratio;
++    }
++    // Adaptive convergence: zero-parallax anchored on the camera's live focus
++    // distance (0035, smoothed) so the subject sits ON the panel in every scene
++    // and background disparity is constant. SF64 rail sections have near-
++    // constant camDist -> rock solid; retune 0.08 vs bridge `3d` camDist.
++    if (eye == 1) {
++        float sohCamD = gSoh3DCamDist;
++        if (!(sohCamD >= 30.0f && sohCamD <= 30000.0f)) {
++            sohCamD = 300.0f;
++        }
++        sSoh3DConvSmooth += (sohCamD - sSoh3DConvSmooth) * 0.08f;
++        float sohStereoOn = (gSoh3DPaused || !gSoh3DInPlay) ? 0.0f : 1.0f;
++        sSoh3DPauseMix += (sohStereoOn - sSoh3DPauseMix) * 0.15f;
++        if (sSoh3DPauseMix < 0.02f) {
++            sSoh3DPauseMix = 0.0f;
++        }
++        sSoh3DAimMix += ((gSoh3DAiming ? 1.0f : 0.0f) - sSoh3DAimMix) * 0.15f;
++        sSoh3DCineMix += ((gSoh3DCinematic ? 1.0f : 0.0f) - sSoh3DCineMix) * 0.10f;
++    }
++    auto sohCvars = Ship::Context::GetInstance()->GetConsoleVariables();
++    float sohDepth = sohCvars->GetFloat("gSohIos.StereoDepth", 0.025f);
++    float sohBias = sohCvars->GetFloat("gSohIos.StereoConvBias", 1.0f);
++    // Round 2 user-tunable RELATIVE depth: the Arwing (per-object, applied via
++    // the 0x5C/0x5D sentinels) and cinematics (whole-scene, smoothed by
++    // sSoh3DCineMix). Both are fractions of the general depth — 1.0 = same,
++    // 0.0 = flat. lerp so the cinematic reduction eases in/out.
++    sSoh3DPlayerDepthFrac = sohCvars->GetFloat("gSohIos.StereoPlayerDepthMul", 0.35f);
++    float sohCineFrac = sohCvars->GetFloat("gSohIos.StereoCinematicMul", 0.4f);
++    float sohCineDepthMul = 1.0f - (1.0f - sohCineFrac) * sSoh3DCineMix;
++    float sohAimDepthMul = 1.0f - 0.7f * sSoh3DAimMix;
++    float sohAimBiasMul = 1.0f - 0.5f * sSoh3DAimMix;
++    sSoh3DConv = sSoh3DConvSmooth * sohBias * sohAimBiasMul;
++    sSoh3DSep = sohDepth * sohAimDepthMul * sohCineDepthMul * sSoh3DConv;
++    gSoh3DDbgConv = sSoh3DConv;
++    gSoh3DDbgSep = sSoh3DSep;
++    mGameFb = mSoh3DEyeFb[eye - 1][mSoh3DPing];
++    sSoh3DEye = eye;
++}
++
++int Interpreter::Soh3DGetEyeFb(int eye) {
++    return (eye >= 1 && eye <= 2) ? mSoh3DEyeFb[eye - 1][mSoh3DPing] : -1;
++}
++
++void Interpreter::Soh3DEndEyePass(int eye) {
++    if (eye >= 1 && eye <= 2 && mSoh3DEyeFb[eye - 1][mSoh3DPing] >= 0) {
++        mRapi->Soh3DPublishOnComplete(mSoh3DEyeFb[eye - 1][mSoh3DPing], eye - 1);
++    }
++    mRapi->EndFrameOffscreen();
++    mRapi->FinishRender();
++    if (eye >= 1 && eye <= 2) {
++        gSoh3DEyeFrames[eye - 1] = gSoh3DEyeFrames[eye - 1] + 1;
++    }
+ }
++#endif
+ 
+ void gfx_set_target_ucode(UcodeHandlers ucode) {
+     ucode_handler_index = ucode;
+--- a/libultraship/src/graphic/Fast3D/backends/gfx_rendering_api.h
++++ b/libultraship/src/graphic/Fast3D/backends/gfx_rendering_api.h
+@@ -52,6 +52,15 @@
+     virtual void OnResize() = 0;
+     virtual void StartFrame() = 0;
+     virtual void EndFrame() = 0;
++    // SOH_IOS (overlay 0034): offscreen stereo eye rendering hooks (no-op base).
++    virtual void EndFrameOffscreen() {
++    }
++    virtual void Soh3DImGuiPrime(int fb) {
++    }
++    virtual void Soh3DImGuiRender(int fb, void* drawData) {
++    }
++    virtual void Soh3DPublishOnComplete(int fb, int eyeIdx) {
++    }
+     virtual void FinishRender() = 0;
+     virtual int CreateFramebuffer() = 0;
+     virtual void UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
+--- a/libultraship/src/graphic/Fast3D/backends/gfx_metal.h
++++ b/libultraship/src/graphic/Fast3D/backends/gfx_metal.h
+@@ -139,6 +139,12 @@
+     void OnResize() override;
+     void StartFrame() override;
+     void EndFrame() override;
++#ifdef __IOS__
++    void EndFrameOffscreen() override;
++    void Soh3DImGuiPrime(int fb) override;
++    void Soh3DImGuiRender(int fb, void* drawData) override;
++    void Soh3DPublishOnComplete(int fb, int eyeIdx) override;
++#endif
+     void FinishRender() override;
+     int CreateFramebuffer() override;
+     void UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
+--- a/libultraship/src/graphic/Fast3D/backends/gfx_metal.cpp
++++ b/libultraship/src/graphic/Fast3D/backends/gfx_metal.cpp
+@@ -865,6 +865,131 @@
+ void GfxRenderingAPIMetal::FinishRender() {
+ }
+ 
++#ifdef __IOS__
++// SOH_IOS (overlay 0034): end-of-eye-pass flush for stereoscopic 3D. The screen
++// framebuffer was never set up this frame (no drawable — a hidden window's
++// acquire stalls), so commit every drawn framebuffer's CB, ride 0024's pending-
++// mip pass on the last one, replicate EndFrame's per-frame state cleanup, and
++// publish the eye texture ON GPU COMPLETION.
++extern "C" {
++extern void* volatile gSoh3DEyeTexture[2];
++}
++static int sSoh3DPublishFb = -1;
++static int sSoh3DPublishEye = -1;
++static std::mutex sSoh3DPublishMutex;
++static void* sSoh3DRetired[16];
++static int sSoh3DRetiredIdx = 0;
++
++void GfxRenderingAPIMetal::Soh3DPublishOnComplete(int fb, int eyeIdx) {
++    sSoh3DPublishFb = fb;
++    sSoh3DPublishEye = eyeIdx;
++}
++
++void GfxRenderingAPIMetal::EndFrameOffscreen() {
++    for (int sohFbId : mDrawnFramebuffers) {
++        auto& sohFb = mFramebuffers[sohFbId];
++        if (sohFb.mCommandBuffer == nullptr) {
++            continue;
++        }
++        if (!sohFb.mHasEndedEncoding && sohFb.mCommandEncoder != nullptr) {
++            sohFb.mCommandEncoder->endEncoding();
++        }
++        if (!sSohIosPendingMips.empty()) {
++            MTL::BlitCommandEncoder* sohBlit = sohFb.mCommandBuffer->blitCommandEncoder();
++            for (MTL::Texture* sohTex : sSohIosPendingMips) {
++                sohBlit->generateMipmaps(sohTex);
++            }
++            sohBlit->endEncoding();
++            for (MTL::Texture* sohTex : sSohIosPendingMips) {
++                sohTex->release();
++            }
++            sSohIosPendingMips.clear();
++        }
++        if (sohFbId == sSoh3DPublishFb) {
++            MTL::Texture* sohPubTex = mTextures[sohFb.mTextureId].texture;
++            int sohPubEye = sSoh3DPublishEye;
++            sSoh3DPublishFb = -1;
++            if (sohPubTex != nullptr && sohPubEye >= 0 && sohPubEye <= 1) {
++                sohPubTex->retain();
++                sohFb.mCommandBuffer->addCompletedHandler(
++                    MTL::HandlerFunction([sohPubTex, sohPubEye](MTL::CommandBuffer* sohCb) {
++                        std::lock_guard<std::mutex> sohLock(sSoh3DPublishMutex);
++                        void* sohOld = (void*)gSoh3DEyeTexture[sohPubEye];
++                        gSoh3DEyeTexture[sohPubEye] = (void*)sohPubTex;
++                        if (sohOld != nullptr) {
++                            void* sohSlot = sSoh3DRetired[sSoh3DRetiredIdx];
++                            if (sohSlot != nullptr) {
++                                ((MTL::Texture*)sohSlot)->release();
++                            }
++                            sSoh3DRetired[sSoh3DRetiredIdx] = sohOld;
++                            sSoh3DRetiredIdx = (sSoh3DRetiredIdx + 1) % 16;
++                        }
++                    }));
++            }
++        }
++        sohFb.mCommandBuffer->addCompletedHandler(
++            MTL::HandlerFunction([](MTL::CommandBuffer* sohCb) {
++                double sohMs = (sohCb->GPUEndTime() - sohCb->GPUStartTime()) * 1000.0;
++                if (sohMs > 0 && sohMs < 1000.0) {
++                    gSohIosGpuMs = (float)sohMs;
++                }
++            }));
++        sohFb.mCommandBuffer->commit();
++    }
++    mDrawnFramebuffers.clear();
++    mCurrentVertexBufferPoolIndex = (mCurrentVertexBufferPoolIndex + 1) % kMaxVertexBufferPoolSize;
++    for (int fb_id = 0; fb_id < (int)mFramebuffers.size(); fb_id++) {
++        FramebufferMetal& fb = mFramebuffers[fb_id];
++        fb.mLastShaderProgram = nullptr;
++        fb.mCommandBuffer = nullptr;
++        fb.mCommandEncoder = nullptr;
++        fb.mHasEndedEncoding = false;
++        fb.mHasBoundVertexShader = false;
++        fb.mHasBoundFragShader = false;
++        for (int i = 0; i < SHADER_MAX_TEXTURES; i++) {
++            fb.mLastBoundTextures[i] = nullptr;
++            fb.mLastBoundSamplers[i] = nullptr;
++        }
++        memset(fb.mViewport, 0, sizeof(MTL::Viewport));
++        memset(fb.mScissorRect, 0, sizeof(MTL::ScissorRect));
++        fb.mLastDepthTest = -1;
++        fb.mLastDepthMask = -1;
++        fb.mLastZmodeDecal = -1;
++    }
++    mFrameAutoreleasePool->release();
++}
++
++void GfxRenderingAPIMetal::Soh3DImGuiPrime(int fb) {
++    if (fb < 0 || fb >= (int)mFramebuffers.size()) {
++        return;
++    }
++    MTL::RenderPassDescriptor* sohPass = mFramebuffers[fb].mRenderPassDescriptor;
++    if (sohPass != nullptr) {
++        ImGui_ImplMetal_NewFrame(sohPass);
++    }
++}
++
++extern "C" volatile int gSoh3DDbgMenuDraws;
++
++void GfxRenderingAPIMetal::Soh3DImGuiRender(int fb, void* drawData) {
++    if (fb < 0 || fb >= (int)mFramebuffers.size() || drawData == nullptr) {
++        return;
++    }
++    auto& sohFb = mFramebuffers[fb];
++    if (sohFb.mCommandBuffer == nullptr || sohFb.mCommandEncoder == nullptr || sohFb.mHasEndedEncoding) {
++        return;
++    }
++    ImDrawData* sohData = (ImDrawData*)drawData;
++    MTL::Texture* sohTex = mTextures[sohFb.mTextureId].texture;
++    if (sohTex != nullptr && sohData->DisplaySize.x > 0.0f && sohData->DisplaySize.y > 0.0f) {
++        sohData->FramebufferScale = ImVec2((float)sohTex->width() / sohData->DisplaySize.x,
++                                           (float)sohTex->height() / sohData->DisplaySize.y);
++    }
++    ImGui_ImplMetal_RenderDrawData(sohData, sohFb.mCommandBuffer, sohFb.mCommandEncoder);
++    gSoh3DDbgMenuDraws = gSoh3DDbgMenuDraws + 1;
++}
++#endif // __IOS__ (0034 stereo backend)
++
+ int GfxRenderingAPIMetal::CreateFramebuffer() {
+     uint32_t texture_id = NewTexture();
+     TextureDataMetal& t = mTextures[texture_id];
+--- a/libultraship/src/graphic/Fast3D/Fast3dWindow.cpp
++++ b/libultraship/src/graphic/Fast3D/Fast3dWindow.cpp
+@@ -171,13 +171,77 @@
+     return mWindowManagerApi->IsFrameReady();
+ }
+ 
++#ifdef __IOS__
++// SOH_IOS (overlay 0034): shell-owned stereoscopic mode flag (visionOS).
++extern "C" {
++extern volatile int gSoh3DMode;
++extern volatile int gSoh3DMenuToggleReq;
++extern volatile int gSoh3DDbgMenuVis;
++extern volatile int gSoh3DDbgMenuBuilds;
++extern volatile int gSoh3DDbgMenuVtx;
++}
++#endif
++
+ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxReplacements) {
+     std::shared_ptr<Window> wnd = Ship::Context::GetInstance()->GetWindow();
+ 
+     // Skip dropped frames
+     if (!wnd->IsFrameReady()) {
+         return false;
++    }
++
++#ifdef __IOS__
++    // SOH_IOS (overlay 0034): in 3D, render BOTH eyes each host frame (same
++    // game time), entirely offscreen; the gui/screen path is skipped (no
++    // drawable while hidden). SwapBuffersBegin still runs once for the
++    // frame-rate pacing sleep. Menu + perf HUD composite into the eyes via
++    // the 0037 Gui split (built ONCE, primed against an eye framebuffer —
++    // the screen backend NewFrame would acquire the hidden drawable — then
++    // the same draw data into BOTH eyes, flat on the panel).
++    static bool sohWas3D = false;
++    if (gSoh3DMode != 0) {
++        sohWas3D = true;
++        auto sohGui = wnd->GetGui();
++        // Ornament Menu button: direct toggle request (keyboard injection
++        // dies on device — the immersive space steals SDL's input focus).
++        if (gSoh3DMenuToggleReq != 0 && sohGui != nullptr && sohGui->GetMenu() != nullptr) {
++            gSoh3DMenuToggleReq = 0;
++            sohGui->GetMenu()->ToggleVisibility();
++        }
++        // Build the menu frame ONCE (even when hidden: its OPEN hotkey and
++        // the perf HUD are processed inside the frame).
++        void* sohMenuData = nullptr;
++        int sohPrimeFb = mInterpreter->Soh3DGetEyeFb(1);
++        if (sohGui != nullptr && mInterpreter->mRapi != nullptr && sohPrimeFb >= 0) {
++            mInterpreter->mRapi->Soh3DImGuiPrime(sohPrimeFb);
++            sohGui->Soh3DBuildMenuFrame();
++            sohMenuData = sohGui->Soh3DGetDrawData();
++            gSoh3DDbgMenuVis = sohGui->GetMenuOrMenubarVisible() ? 1 : 0;
++            gSoh3DDbgMenuBuilds = gSoh3DDbgMenuBuilds + 1;
++            ImDrawData* sohDD = (ImDrawData*)sohMenuData;
++            gSoh3DDbgMenuVtx = (sohDD != nullptr) ? sohDD->TotalVtxCount : -1;
++        }
++        for (int sohEye = 1; sohEye <= 2; sohEye++) {
++            mInterpreter->Soh3DSetEye(sohEye);
++            mInterpreter->StartFrame();
++            mInterpreter->Run(commands, mtxReplacements);
++            if (sohMenuData != nullptr && mInterpreter->mRapi != nullptr) {
++                mInterpreter->mRapi->Soh3DImGuiRender(mInterpreter->Soh3DGetEyeFb(sohEye), sohMenuData);
++            }
++            mInterpreter->Soh3DEndEyePass(sohEye);
++        }
++        if (sohMenuData != nullptr) {
++            sohGui->Soh3DFinishMenuFrame();
++        }
++        mWindowManagerApi->SwapBuffersBegin();
++        mWindowManagerApi->SwapBuffersEnd();
++        return true;
+     }
++    if (sohWas3D) {
++        sohWas3D = false;
++        mInterpreter->Soh3DSetEye(0); // restore 2D state ONCE
++    }
++#endif
+ 
+     auto gui = wnd->GetGui();
+     // Setup of the backend frames and draw initial Window and GUI menus

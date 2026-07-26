@@ -1,0 +1,69 @@
+Overlay patch 0026: iOS supersampling (SSAA) — SYNC WAVE 2 addendum D,
+MANDATORY (Ghostship 0032 = reference 0036; user directive 2026-07-21).
+FINDING: on iOS the game renders SUB-NATIVE — CalculateGameViewport sets
+mCurDimensions from ImGui's POINT-space content region, and ImGui::Image
+upscales it to the native-pixel fb0. Confirmed on SoH: iPhone shipped
+1824x840 vs the 2736x1260 drawable (67%). Starship has the same pipeline
+(Fast3dWindow -> ImGui::Image present), so it renders sub-native too. Fix:
+scale mCurDimensions to (native drawable px * ssaa) in StartFrame — ssaa=1.0
+alone fixes the sub-native upscale; >1.0 renders above native and
+downsamples (true SSAA). Factor is native-px-relative so it lands on
+native*ssaa whether mCurDimensions arrives as points or pixels. ONLY
+mCurDimensions scales — mNativeDimensions and mGameWindowViewport stay
+untouched (their equality-guarded uses deactivate to the safe full-fb path).
+Clamped to the backend max texture size. Shell provides SohIos_SsaaFactor
+(gSohIos.Supersample, 1.0-2.0, default 1.0 — SF64 is light but ships 1.0
+until a device gpu_ms check justifies higher; the slider lets the user try
+2.0 now) and SohIos_DrawablePixelWidth. __IOS__-only; macOS build pristine.
+Fork note: Starship's interpreter StartFrame is byte-identical to the
+reference's anchor; no stereo eye path here (SF64 has no visionOS build).
+
+--- a/libultraship/src/graphic/Fast3D/interpreter.cpp
++++ b/libultraship/src/graphic/Fast3D/interpreter.cpp
+@@ -4272,6 +4272,12 @@
+     return false;
+ #endif
+ }
++
++#ifdef __IOS__
++// SOH_IOS (overlay 0026): SSAA hooks provided by the app shell (SohIosShell.m).
++extern "C" float SohIos_SsaaFactor(void);
++extern "C" uint32_t SohIos_DrawablePixelWidth(void);
++#endif
+ 
+ void Interpreter::StartFrame() {
+     mWapi->GetDimensions(&mGfxCurrentWindowDimensions.width, &mGfxCurrentWindowDimensions.height, &mCurWindowPosX,
+@@ -4280,6 +4286,33 @@
+         // Avoid division by zero
+         mCurDimensions.height = 1;
+     }
++#ifdef __IOS__
++    // SOH_IOS (overlay 0026) SSAA: CalculateGameViewport just set
++    // mCurDimensions from ImGui's POINT-space content region; the game renders
++    // offscreen and ImGui::Image scales it to the native-pixel fb0. Scale
++    // mCurDimensions to (native drawable px * ssaa) so that scale is a
++    // downsample (supersample), never an upscale. Uniform factor => aspect
++    // preserved. mNativeDimensions and mGameWindowViewport are NOT scaled —
++    // their equality-guarded uses deactivate to the safe full-fb path.
++    {
++        float sohSsaa = SohIos_SsaaFactor();
++        uint32_t sohNativePxW = SohIos_DrawablePixelWidth();
++        if (sohSsaa > 0.0f && sohNativePxW > 0 && mCurDimensions.width > 0) {
++            float sohF = ((float)sohNativePxW / (float)mCurDimensions.width) * sohSsaa;
++            uint32_t sohW = (uint32_t)(mCurDimensions.width * sohF + 0.5f);
++            uint32_t sohH = (uint32_t)(mCurDimensions.height * sohF + 0.5f);
++            // mGameFb is a texture — clamp uniformly to the backend max.
++            int sohMax = mRapi->GetMaxTextureSize();
++            if (sohMax > 0 && ((int)sohW > sohMax || (int)sohH > sohMax)) {
++                float sohClamp = (float)sohMax / (float)(sohW > sohH ? sohW : sohH);
++                sohW = (uint32_t)(sohW * sohClamp);
++                sohH = (uint32_t)(sohH * sohClamp);
++            }
++            mCurDimensions.width = sohW;
++            mCurDimensions.height = sohH;
++        }
++    }
++#endif
+     mCurDimensions.aspect_ratio = (float)mCurDimensions.width / (float)mCurDimensions.height;
+ 
+     // Update the framebuffer sizes when the viewport or native dimension changes

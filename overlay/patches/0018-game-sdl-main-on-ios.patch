@@ -1,0 +1,28 @@
+Overlay patch 0018: name the game entry SDL_main on iOS (2ship trap #2).
+Game.cpp defines plain main() on non-Windows; at link it wins over SDL2main's
+main(), silently bypassing the UIKit shim: no UIApplicationMain, no UIKit app
+context, SDL_CreateWindow returns NULL, boot SIGSEGVs far away. (Upstream's
+`extern "C"` under PLATFORM_IOS shows intent, but SDL_main.h's rename macro
+does not fire in this TU.) With SDL_main exported, SDL2main's main() runs
+UIApplicationMain and calls SDL_main on the main thread after launch.
+Desktop unaffected. Caught by build-sim.sh's nm assertion, not at runtime.
+
+--- a/src/port/Game.cpp
++++ b/src/port/Game.cpp
+@@ -31,10 +31,13 @@
+ 
+ #ifdef _WIN32
+ int SDL_main(int argc, char **argv) {
++#elif defined(PLATFORM_IOS)
++// SOH_IOS (overlay 0018): SDL2main's UIKit shim owns main() on iOS — it runs
++// UIApplicationMain and calls SDL_main on the main thread after launch.
++// Naming this main() wins the link over SDL2main's and bypasses the shim
++// (no UIKit app context; SDL_CreateWindow returns NULL). 2ship trap #2.
++extern "C" int SDL_main(int argc, char* argv[]) {
+ #else
+-#if defined(__cplusplus) && defined(PLATFORM_IOS)
+-extern "C"
+-#endif
+ int main(int argc, char *argv[]) {
+ #endif
+     GameEngine::Create();

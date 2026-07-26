@@ -1,0 +1,21 @@
+Overlay patch 0002: build TorchExternal without the non-SF64 game modules.
+Torch standalone defaults BUILD_SM64/MK64/FZERO/MARIO_ARTIST=ON; the SM64
+factories log raw enum values (BehaviorOpcode/GeoOpcode/LevelOpcode), which
+fmt 11 (via 0001's spdlog v1.15.3) rejects: "implicit instantiation of
+undefined template fmt::detail::type_is_unformattable_for<...>". The game's
+own CMakeLists already builds the vendored torch LIBRARY with SM64/MK64/FZERO
+OFF — this aligns the standalone CLI with the in-app extractor's factory set
+and dodges the fmt-11-unclean modules we never invoke. SF64 + NAudio stay ON
+(SF64 audio extraction uses the NAudio factories).
+
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -610,6 +610,8 @@
+ 	PREFIX TorchExternal
+     SOURCE_DIR ${CMAKE_SOURCE_DIR}/tools/Torch
+     CMAKE_ARGS -DCMAKE_INSTALL_PREFIX=${CMAKE_BINARY_DIR}/Torch
++               -DBUILD_SM64=OFF -DBUILD_MK64=OFF -DBUILD_FZERO=OFF
++               -DBUILD_MARIO_ARTIST=OFF
+ )
+ ExternalProject_Get_Property(TorchExternal install_dir)
+ if (MSVC)
