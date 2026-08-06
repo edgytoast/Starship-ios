@@ -14,6 +14,7 @@ SHIP_O2R="$ROOT/oracle/build-cmake/starship.o2r"
 export CMAKE_POLICY_VERSION_MINIMUM=3.5
 
 cmake --no-warn-unused-cli -S "$ROOT/vendor/Starship" -B "$BUILD" -GXcode \
+    -DCMAKE_XCODE_ATTRIBUTE_STRIP_INSTALLED_PRODUCT=NO \
     -DCMAKE_SYSTEM_NAME=iOS -DPLATFORM=SIMULATORARM64 \
     -DCMAKE_OSX_SYSROOT=iphonesimulator \
     -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 -DCMAKE_BUILD_TYPE:STRING=Release \

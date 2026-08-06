@@ -21,7 +21,7 @@ uniformity.
 
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -66,13 +66,14 @@
+@@ -56,13 +56,14 @@
  endif()
  
  if(IOS)
@@ -40,7 +40,7 @@ uniformity.
  endif()
  
  ################################################################################
-@@ -176,22 +177,112 @@
+@@ -166,22 +167,119 @@
  list(FILTER ALL_FILES EXCLUDE REGEX "src/mods/object_ram.c")
  
  if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
@@ -145,6 +145,13 @@ uniformity.
 +		<true/>
 +	</dict>")
 +    endif()
++    # SOH_IOS (overlay 0012, D-039 going-forward scheme): CFBundleShortVersionString
++    # stays the public base (1.0.0); CFBundleVersion carries the incrementing dev
++    # counter so each OTA re-install is seen as newer (the version string is
++    # pinned to the base). Build scripts pass -DSOH_IOS_BUNDLE_VERSION=N; default 1.
++    if(NOT DEFINED SOH_IOS_BUNDLE_VERSION OR SOH_IOS_BUNDLE_VERSION STREQUAL "")
++        set(SOH_IOS_BUNDLE_VERSION 1)
++    endif()
 +    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/ios/Info.plist.in ${CMAKE_BINARY_DIR}/ios/Info.plist @ONLY)
      set_target_properties(
          ${PROJECT_NAME}
@@ -164,7 +171,7 @@ uniformity.
      )
  else()
      add_executable(${PROJECT_NAME} ${ALL_FILES})
-@@ -368,6 +459,44 @@
+@@ -355,6 +453,44 @@
      target_include_directories(${PROJECT_NAME} PRIVATE
          ${DEVKITPRO}/portlibs/wiiu/include/
      )
@@ -209,7 +216,7 @@ uniformity.
  else()
      find_package(Ogg REQUIRED)
      find_package(Vorbis REQUIRED)
-@@ -397,6 +526,11 @@
+@@ -384,6 +520,11 @@
  option(BUILD_MK64 "Build with Mario Kart 64 support" OFF)
  option(BUILD_FZERO "Build with F-Zero X support" OFF)
  add_subdirectory(tools/Torch)
@@ -243,9 +250,9 @@ uniformity.
 +	<key>CFBundlePackageType</key>
 +	<string>APPL</string>
 +	<key>CFBundleShortVersionString</key>
-+	<string>1.0.0</string>
++	<string>1.0.1</string>
 +	<key>CFBundleVersion</key>
-+	<string>1</string>
++	<string>@SOH_IOS_BUNDLE_VERSION@</string>
 +	<key>LSRequiresIPhoneOS</key>
 +	<true/>
 +	<key>UIFileSharingEnabled</key>
